@@ -746,6 +746,11 @@ void App::begin() {
 
   display_.renderProgress("SD", "Loading books", "Use SD converter for EPUB", 0);
   storageReady_ = storage_.begin();
+  Serial.printf("[boot] storage ready=%d\n", storageReady_);
+  const bool dataStoreOk = dataStore_.begin();
+  Serial.printf("[boot] data store ready=%d\n", dataStoreOk);
+  const bool bleOk = bleSync_.begin(dataStore_);
+  Serial.printf("[boot] ble ready=%d\n", bleOk);
   const uint16_t savedWpm = preferences_.getUShort(kPrefWpm, reader_.wpm());
   reader_.setWpm(savedWpm);
 
@@ -778,6 +783,7 @@ void App::begin() {
 void App::update(uint32_t nowMs) {
   button_.update(nowMs);
   powerButton_.update(nowMs);
+  bleSync_.update();
   const bool standbyComboConsumed = handleStandbyCombo(nowMs);
   if (!standbyComboConsumed) {
     handleBootButton(nowMs);

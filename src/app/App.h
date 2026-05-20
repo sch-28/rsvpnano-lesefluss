@@ -15,7 +15,9 @@
 #include "input/TouchHandler.h"
 #include "reader/ReadingLoop.h"
 #include "rss/RssFeedManager.h"
+#include "storage/RsvpDataStore.h"
 #include "storage/StorageManager.h"
+#include "sync/BleSyncManager.h"
 #include "sync/CompanionSyncManager.h"
 #include "timer/FocusTimer.h"
 #include "update/OtaUpdater.h"
@@ -416,6 +418,8 @@ class App {
   OtaUpdater otaUpdater_;
   RssFeedManager rssFeedManager_;
   CompanionSyncManager companionSync_;
+  RsvpDataStore dataStore_;
+  BleSyncManager bleSync_;
   UsbMassStorageManager usbTransfer_;
   Preferences preferences_;
   PausedTouchSession pausedTouch_;
