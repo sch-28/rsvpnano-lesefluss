@@ -3,6 +3,8 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+#include <vector>
+
 #include "storage/RsvpDataStore.h"
 
 // NimBLE GATT server exposing the multibook BLE schema defined in
@@ -20,12 +22,17 @@ class BleSyncManager {
   bool active() const { return active_; }
 
  private:
+  // SD-touching steps run on the Arduino loop task, not the NimBLE host task.
+  // Callbacks only push data into these fields; update() drains them.
   struct UploadState {
-    bool inProgress = false;
+    bool inProgress = false;       // beginUpload succeeded, file open on SD
+    bool pendingHeader = false;    // header arrived, beginUpload not yet called
+    bool pendingFinish = false;    // total reached, finishUpload not yet called
     uint32_t bytesReceived = 0;
     uint32_t bytesExpected = 0;
     String filename;
     String category;
+    std::vector<uint8_t> pendingBytes;  // body chunks awaiting SD write
   };
 
   // Char callback fan-out. NimBLECharacteristicCallbacks subclasses live in

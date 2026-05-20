@@ -289,6 +289,51 @@ void BleSyncManager::update() {
   if (!active_) {
     return;
   }
+
+  // Drain any SD work captured by the NimBLE write callback.
+  if (upload_.pendingHeader) {
+    upload_.pendingHeader = false;
+    String error;
+    if (!dataStore_->beginUpload(upload_.category, upload_.filename, error)) {
+      Serial.printf("[ble-xfer] beginUpload failed: %s\n", error.c_str());
+      String msg = String("NACK:START:") + error;
+      notifyTransfer(msg.c_str());
+      resetUpload();
+    } else {
+      upload_.inProgress = true;
+      Serial.printf("[ble-xfer] begin %s (%s) size=%u\n", upload_.filename.c_str(),
+                    upload_.category.c_str(), static_cast<unsigned>(upload_.bytesExpected));
+      notifyTransfer("ACK:START");
+    }
+  }
+
+  if (upload_.inProgress && !upload_.pendingBytes.empty()) {
+    const uint32_t beforeWrite = millis();
+    const bool ok = dataStore_->appendUpload(upload_.pendingBytes.data(),
+                                              upload_.pendingBytes.size());
+    const uint32_t writeMs = millis() - beforeWrite;
+    if (writeMs > 20) {
+      Serial.printf("[ble-xfer] slow SD write %u ms\n", static_cast<unsigned>(writeMs));
+    }
+    if (!ok) {
+      Serial.printf("[ble-xfer] appendUpload failed at offset %u\n",
+                    static_cast<unsigned>(upload_.bytesReceived));
+      dataStore_->finishUpload(false);
+      resetUpload();
+      notifyTransfer("NACK:WRITE:io");
+      return;
+    }
+    upload_.pendingBytes.clear();
+  }
+
+  if (upload_.pendingFinish) {
+    upload_.pendingFinish = false;
+    const bool ok = dataStore_->finishUpload(true);
+    Serial.printf("[ble-xfer] finishUpload ok=%d\n", ok);
+    resetUpload();
+    notifyTransfer(ok ? "ACK:END" : "NACK:END:rename");
+  }
+
   const uint32_t now = millis();
   if (now - lastStatusLogMs_ >= 5000) {
     lastStatusLogMs_ = now;
@@ -407,8 +452,7 @@ void BleSyncManager::onTransferWrite(const uint8_t *bytes, size_t len) {
     return;
   }
 
-  if (!upload_.inProgress) {
-    // First frame: parse JSON header.
+  if (!upload_.inProgress && !upload_.pendingHeader) {
     String body;
     body.reserve(len);
     for (size_t i = 0; i < len; ++i) {
@@ -423,34 +467,20 @@ void BleSyncManager::onTransferWrite(const uint8_t *bytes, size_t len) {
       notifyTransfer("NACK:START:bad_header");
       return;
     }
-    String error;
-    if (!dataStore_->beginUpload(category, filename, error)) {
-      String msg = String("NACK:START:") + error;
-      notifyTransfer(msg.c_str());
-      return;
-    }
-    upload_.inProgress = true;
-    upload_.bytesReceived = 0;
-    upload_.bytesExpected = sizeBytes;
     upload_.filename = filename;
     upload_.category = category;
-    notifyTransfer("ACK:START");
+    upload_.bytesExpected = sizeBytes;
+    upload_.bytesReceived = 0;
+    upload_.pendingHeader = true;
     return;
   }
 
-  // Body frame.
-  if (!dataStore_->appendUpload(bytes, len)) {
-    dataStore_->finishUpload(false);
-    resetUpload();
-    notifyTransfer("NACK:WRITE:io");
-    return;
-  }
-  upload_.bytesReceived += len;
-
-  if (upload_.bytesExpected > 0 && upload_.bytesReceived >= upload_.bytesExpected) {
-    const bool ok = dataStore_->finishUpload(true);
-    resetUpload();
-    notifyTransfer(ok ? "ACK:END" : "NACK:END:rename");
+  if (upload_.inProgress) {
+    upload_.pendingBytes.insert(upload_.pendingBytes.end(), bytes, bytes + len);
+    upload_.bytesReceived += len;
+    if (upload_.bytesExpected > 0 && upload_.bytesReceived >= upload_.bytesExpected) {
+      upload_.pendingFinish = true;
+    }
   }
 }
 
@@ -462,8 +492,12 @@ void BleSyncManager::resetUpload() {
 }
 
 void BleSyncManager::notifyTransfer(const char *msg) {
-  if (transferChar_ != nullptr) {
-    transferChar_->setValue(reinterpret_cast<const uint8_t *>(msg), strlen(msg));
-    transferChar_->notify();
+  if (transferChar_ == nullptr) {
+    return;
   }
+  Serial.printf("[ble-xfer] notify-> %s\n", msg);
+  transferChar_->setValue(reinterpret_cast<const uint8_t *>(msg), strlen(msg));
+  Serial.println("[ble-xfer] setValue done");
+  transferChar_->notify();
+  Serial.println("[ble-xfer] notify done");
 }
