@@ -4870,10 +4870,16 @@ void App::loadPendingBootBook(uint32_t nowMs) {
 
 void App::saveReadingPosition(bool force) {
   if (!usingStorageBook_ || currentBookPath_.isEmpty()) {
+    Serial.printf("[save] SKIP usingStorage=%d pathEmpty=%d force=%d\n",
+                  usingStorageBook_, currentBookPath_.isEmpty(), force);
     return;
   }
 
   const size_t wordIndex = reader_.currentIndex();
+  Serial.printf("[save] entry force=%d word=%u last=%u path=%s\n",
+                force, static_cast<unsigned>(wordIndex),
+                static_cast<unsigned>(lastSavedWordIndex_),
+                currentBookPath_.c_str());
   if (!force && wordIndex == lastSavedWordIndex_) {
     return;
   }
@@ -4933,6 +4939,11 @@ bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPosition
 
   const uint32_t savedWordIndex =
       savedWordIndexForBook(currentBookPath_, allowLegacyPositionFallback);
+  Serial.printf("[load] book=%s key=%s saved=%u nosaved=%d\n",
+                currentBookPath_.c_str(),
+                bookPositionKey(currentBookPath_).c_str(),
+                static_cast<unsigned>(savedWordIndex),
+                savedWordIndex == kNoSavedWordIndex);
   if (savedWordIndex != kNoSavedWordIndex) {
     renderStorageStatus("Opening book", currentBookTitle_.c_str(), "Restoring position", 78);
     reader_.seekTo(savedWordIndex);
@@ -4961,16 +4972,29 @@ bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPosition
 
 void App::onBlePositionUpdate(const String &hash, uint32_t wordIndex) {
   if (!usingStorageBook_ || currentBookPath_.isEmpty()) {
+    Serial.printf("[ble-update] SKIP hash=%s word=%u usingStorage=%d pathEmpty=%d\n",
+                  hash.c_str(), static_cast<unsigned>(wordIndex),
+                  usingStorageBook_, currentBookPath_.isEmpty());
     return;
   }
   // RsvpDataStore::hashBookPath and the App-side hashBookPath share the same
   // FNV-1a algorithm + formatting; either produces the same 8-char hex string.
   const String currentHash = RsvpDataStore::hashBookPath(currentBookPath_);
   if (currentHash != hash) {
+    Serial.printf("[ble-update] SKIP hash mismatch incoming=%s current=%s\n",
+                  hash.c_str(), currentHash.c_str());
     return;
   }
-  const size_t target = std::min(static_cast<size_t>(wordIndex), reader_.wordCount() - 1);
+  const size_t wc = reader_.wordCount();
+  const size_t prevIdx = reader_.currentIndex();
+  const size_t target = std::min(static_cast<size_t>(wordIndex), wc == 0 ? 0u : wc - 1);
+  Serial.printf("[ble-update] PRE wc=%u prevIdx=%u target=%u last=%u state=%d\n",
+                static_cast<unsigned>(wc), static_cast<unsigned>(prevIdx),
+                static_cast<unsigned>(target),
+                static_cast<unsigned>(lastSavedWordIndex_),
+                static_cast<int>(state_));
   if (target == reader_.currentIndex()) {
+    Serial.println("[ble-update] noop (same position)");
     return;
   }
   reader_.seekTo(target);
@@ -4978,7 +5002,16 @@ void App::onBlePositionUpdate(const String &hash, uint32_t wordIndex) {
   // doesn't try to write a stale `reader_.currentIndex()` over the just-pushed
   // value.
   lastSavedWordIndex_ = target;
-  Serial.printf("[app] ble position update -> word=%u\n", static_cast<unsigned>(target));
+  // Force a redraw — in Paused/Menu the main loop does not auto-render, so the
+  // device would otherwise stay frozen on the old word until the user touches
+  // the screen.
+  if (state_ == AppState::Playing || state_ == AppState::Paused) {
+    renderActiveReader(millis());
+  }
+  Serial.printf("[ble-update] POST idx=%u last=%u rendered=%d\n",
+                static_cast<unsigned>(reader_.currentIndex()),
+                static_cast<unsigned>(lastSavedWordIndex_),
+                (state_ == AppState::Playing || state_ == AppState::Paused) ? 1 : 0);
 }
 
 String App::bookPositionKey(const String &bookPath) const {

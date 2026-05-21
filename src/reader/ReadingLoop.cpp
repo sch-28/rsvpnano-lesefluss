@@ -666,8 +666,11 @@ void ReadingLoop::scrub(int steps) {
 
 void ReadingLoop::seekTo(size_t wordIndex) {
   const size_t count = wordCount();
+  const size_t prevIndex = currentIndex_;
   if (count == 0) {
     currentWord_ = "";
+    Serial.printf("[seek] target=%u count=0 NOOP prev=%u\n",
+                  static_cast<unsigned>(wordIndex), static_cast<unsigned>(prevIndex));
     return;
   }
 
@@ -677,6 +680,9 @@ void ReadingLoop::seekTo(size_t wordIndex) {
 
   currentIndex_ = wordIndex;
   setCurrentWordFromIndex();
+  Serial.printf("[seek] target=%u count=%u prev=%u now=%u\n",
+                static_cast<unsigned>(wordIndex), static_cast<unsigned>(count),
+                static_cast<unsigned>(prevIndex), static_cast<unsigned>(currentIndex_));
 }
 
 void ReadingLoop::seekRelative(size_t baseIndex, int steps) {

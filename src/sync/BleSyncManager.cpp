@@ -289,7 +289,8 @@ bool BleSyncManager::begin(RsvpDataStore &dataStore) {
   positionChar_->setCallbacks(new BlePositionCallbacks(this));
 
   transferChar_ = service->createCharacteristic(
-      TRANSFER_CHAR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
+      TRANSFER_CHAR_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY);
   transferChar_->setCallbacks(new BleTransferCallbacks(this));
 
   settingsChar_ = service->createCharacteristic(
@@ -499,9 +500,12 @@ bool BleSyncManager::applyPositionJson(const String &body, String &error) {
   // Capture the write request; the actual NVS write + listener fire on the
   // Arduino loop task via update(). Keeping it off the NimBLE host task
   // avoids stalls when the listener does work (e.g. seeking the live reader).
+  const bool coalesced = pendingPosition_;
   pendingPositionHash_ = hash;
   pendingPositionWord_ = wordIndex;
   pendingPosition_ = true;
+  Serial.printf("[ble-pos] queued hash=%s word=%u coalesced=%d\n", hash.c_str(),
+                static_cast<unsigned>(wordIndex), coalesced);
   return true;
 }
 

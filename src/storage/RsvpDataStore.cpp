@@ -431,10 +431,13 @@ bool RsvpDataStore::readPosition(const String &hash, uint32_t &wordIndex, uint32
 
 bool RsvpDataStore::writePosition(const String &hash, uint32_t wordIndex) {
   if (!began_ || hash.isEmpty()) {
+    Serial.printf("[ds-write] SKIP began=%d hashEmpty=%d\n", began_, hash.isEmpty());
     return false;
   }
   const String posKey = bookPositionKey(hash);
   preferences_.putUInt(posKey.c_str(), wordIndex);
+  Serial.printf("[ds-write] key=%s word=%u hash=%s\n", posKey.c_str(),
+                static_cast<unsigned>(wordIndex), hash.c_str());
   return true;
 }
 
