@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+#include <functional>
 #include <vector>
 
 #include "storage/RsvpDataStore.h"
@@ -16,10 +17,17 @@
 // a time.
 class BleSyncManager {
  public:
+  // Fired on the Arduino loop task (not the NimBLE host task) whenever the
+  // app pushes a position write that names the device's currently-active
+  // book hash. Listener should seek the live reader to wordIndex.
+  using PositionListener = std::function<void(const String &hash, uint32_t wordIndex)>;
+
   bool begin(RsvpDataStore &dataStore);
   void update();
   void end();
   bool active() const { return active_; }
+
+  void setPositionListener(PositionListener listener) { positionListener_ = std::move(listener); }
 
  private:
   // SD-touching steps run on the Arduino loop task, not the NimBLE host task.
@@ -44,6 +52,7 @@ class BleSyncManager {
   friend class BleTransferCallbacks;
   friend class BleSettingsCallbacks;
   friend class BleStorageCallbacks;
+  friend class BleDeleteCallbacks;
   friend class BleServerCallbacks;
 
   String buildInfoJson();
@@ -54,6 +63,7 @@ class BleSyncManager {
   bool applyPositionJson(const String &body, String &error);
 
   void onTransferWrite(const uint8_t *bytes, size_t len);
+  void onDeleteWrite(const uint8_t *bytes, size_t len);
   void resetUpload();
   void notifyTransfer(const char *msg);
 
@@ -66,8 +76,21 @@ class BleSyncManager {
   NimBLECharacteristic *transferChar_ = nullptr;
   NimBLECharacteristic *settingsChar_ = nullptr;
   NimBLECharacteristic *storageChar_ = nullptr;
+  NimBLECharacteristic *deleteChar_ = nullptr;
 
   UploadState upload_;
+  // Pending delete request captured by the NimBLE write callback; drained on
+  // the Arduino loop task by update() so SD remove + NVS writes don't run on
+  // the BLE host task.
+  bool pendingDelete_ = false;
+  String pendingDeleteHash_;
+  // Pending position write captured by the NimBLE host task. Drained on the
+  // Arduino loop task so the NVS write + reader-seek listener fire away from
+  // BLE callback context.
+  bool pendingPosition_ = false;
+  String pendingPositionHash_;
+  uint32_t pendingPositionWord_ = 0;
+  PositionListener positionListener_;
   bool active_ = false;
   uint32_t lastStatusLogMs_ = 0;
 };

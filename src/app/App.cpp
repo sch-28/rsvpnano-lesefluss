@@ -749,6 +749,8 @@ void App::begin() {
   Serial.printf("[boot] storage ready=%d\n", storageReady_);
   const bool dataStoreOk = dataStore_.begin();
   Serial.printf("[boot] data store ready=%d\n", dataStoreOk);
+  bleSync_.setPositionListener(
+      [this](const String &hash, uint32_t wordIndex) { onBlePositionUpdate(hash, wordIndex); });
   const bool bleOk = bleSync_.begin(dataStore_);
   Serial.printf("[boot] ble ready=%d\n", bleOk);
   const uint16_t savedWpm = preferences_.getUShort(kPrefWpm, reader_.wpm());
@@ -4955,6 +4957,28 @@ bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPosition
                 static_cast<unsigned int>(chapterMarkers_.size()),
                 static_cast<unsigned int>(paragraphStarts_.size()));
   return true;
+}
+
+void App::onBlePositionUpdate(const String &hash, uint32_t wordIndex) {
+  if (!usingStorageBook_ || currentBookPath_.isEmpty()) {
+    return;
+  }
+  // RsvpDataStore::hashBookPath and the App-side hashBookPath share the same
+  // FNV-1a algorithm + formatting; either produces the same 8-char hex string.
+  const String currentHash = RsvpDataStore::hashBookPath(currentBookPath_);
+  if (currentHash != hash) {
+    return;
+  }
+  const size_t target = std::min(static_cast<size_t>(wordIndex), reader_.wordCount() - 1);
+  if (target == reader_.currentIndex()) {
+    return;
+  }
+  reader_.seekTo(target);
+  // Mark this position as already saved so the next saveReadingPosition pass
+  // doesn't try to write a stale `reader_.currentIndex()` over the just-pushed
+  // value.
+  lastSavedWordIndex_ = target;
+  Serial.printf("[app] ble position update -> word=%u\n", static_cast<unsigned>(target));
 }
 
 String App::bookPositionKey(const String &bookPath) const {

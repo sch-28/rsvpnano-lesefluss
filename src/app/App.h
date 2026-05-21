@@ -40,6 +40,12 @@ class App {
   void begin();
   void update(uint32_t nowMs);
 
+  // Called by BleSyncManager (via setPositionListener) on the Arduino loop
+  // task when the app pushes a position write naming the currently-open
+  // book. Seeks the live reader to wordIndex and resets the saved-position
+  // tracker so the next save doesn't overwrite with a stale value.
+  void onBlePositionUpdate(const String &hash, uint32_t wordIndex);
+
  private:
   static constexpr size_t kOtaVersionLabelMax = 32;
   static constexpr size_t kOtaSummaryLabelMax = 40;

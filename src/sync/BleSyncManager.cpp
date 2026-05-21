@@ -12,6 +12,7 @@ using lesefluss::ble::POSITION_CHAR_UUID;
 using lesefluss::ble::PROTOCOL_VERSION;
 using lesefluss::ble::SERVICE_UUID;
 using lesefluss::ble::SETTINGS_CHAR_UUID;
+using lesefluss::ble::DELETE_CHAR_UUID;
 using lesefluss::ble::STORAGE_CHAR_UUID;
 using lesefluss::ble::TRANSFER_CHAR_UUID;
 
@@ -183,6 +184,18 @@ class BlePositionCallbacks : public NimBLECharacteristicCallbacks {
   BleSyncManager *mgr_;
 };
 
+class BleDeleteCallbacks : public NimBLECharacteristicCallbacks {
+ public:
+  explicit BleDeleteCallbacks(BleSyncManager *mgr) : mgr_(mgr) {}
+  void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &) override {
+    const auto value = chr->getValue();
+    mgr_->onDeleteWrite(reinterpret_cast<const uint8_t *>(value.data()), value.size());
+  }
+
+ private:
+  BleSyncManager *mgr_;
+};
+
 class BleTransferCallbacks : public NimBLECharacteristicCallbacks {
  public:
   explicit BleTransferCallbacks(BleSyncManager *mgr) : mgr_(mgr) {}
@@ -199,12 +212,25 @@ class BleSettingsCallbacks : public NimBLECharacteristicCallbacks {
  public:
   explicit BleSettingsCallbacks(BleSyncManager *mgr) : mgr_(mgr) {}
   void onRead(NimBLECharacteristic *chr, NimBLEConnInfo &) override {
-    // Settings JSON port is deferred. Returns a minimal envelope so the
-    // app can detect the characteristic exists without crashing on parse.
-    chr->setValue("{\"ok\":false,\"error\":\"settings not yet wired\"}");
+    if (mgr_->dataStore_ == nullptr) {
+      chr->setValue("{\"ok\":false,\"error\":\"data store not ready\"}");
+      return;
+    }
+    chr->setValue(mgr_->dataStore_->settingsJson().c_str());
   }
   void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &) override {
-    chr->setValue("{\"ok\":false,\"error\":\"settings not yet wired\"}");
+    if (mgr_->dataStore_ == nullptr) {
+      chr->setValue("{\"ok\":false,\"error\":\"data store not ready\"}");
+      return;
+    }
+    const String body = String(chr->getValue().c_str());
+    String error;
+    if (!mgr_->dataStore_->applySettingsJson(body, error)) {
+      const String envelope = String("{\"ok\":false,\"error\":\"") + error + "\"}";
+      chr->setValue(envelope.c_str());
+      return;
+    }
+    chr->setValue(mgr_->dataStore_->settingsJson().c_str());
   }
 
  private:
@@ -273,6 +299,9 @@ bool BleSyncManager::begin(RsvpDataStore &dataStore) {
   storageChar_ = service->createCharacteristic(STORAGE_CHAR_UUID, NIMBLE_PROPERTY::READ);
   storageChar_->setCallbacks(new BleStorageCallbacks(this));
 
+  deleteChar_ = service->createCharacteristic(DELETE_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
+  deleteChar_->setCallbacks(new BleDeleteCallbacks(this));
+
   service->start();
 
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
@@ -288,6 +317,28 @@ bool BleSyncManager::begin(RsvpDataStore &dataStore) {
 void BleSyncManager::update() {
   if (!active_) {
     return;
+  }
+
+  if (pendingDelete_) {
+    const String hash = pendingDeleteHash_;
+    pendingDelete_ = false;
+    pendingDeleteHash_ = "";
+    const bool ok = dataStore_->deleteBook(hash);
+    Serial.printf("[ble-delete] hash=%s ok=%d\n", hash.c_str(), ok);
+  }
+
+  if (pendingPosition_) {
+    const String hash = pendingPositionHash_;
+    const uint32_t wordIndex = pendingPositionWord_;
+    pendingPosition_ = false;
+    pendingPositionHash_ = "";
+    pendingPositionWord_ = 0;
+    const bool ok = dataStore_->writePosition(hash, wordIndex);
+    Serial.printf("[ble-pos] write hash=%s word=%u ok=%d\n", hash.c_str(),
+                  static_cast<unsigned>(wordIndex), ok);
+    if (ok && positionListener_) {
+      positionListener_(hash, wordIndex);
+    }
   }
 
   // Drain any SD work captured by the NimBLE write callback.
@@ -421,10 +472,11 @@ bool BleSyncManager::applyActiveHash(const String &hash, String &error) {
     error = "Data store not ready";
     return false;
   }
-  if (dataStore_->resolvePathByHash(hash).isEmpty()) {
-    error = "Unknown book hash";
-    return false;
-  }
+  // Skip SD-touching validation: writing to NVS is fast, and resolvePathByHash
+  // would call listBooks() which scans the SD card. After a heavy upload the SD
+  // bus may still be flushing, blocking the NimBLE host task and timing out
+  // the next BLE write. Caller is trusted to provide a valid hash; on next
+  // reader-open the device will surface "book not found" if it isn't.
   dataStore_->setActiveBookHash(hash);
   return true;
 }
@@ -444,7 +496,13 @@ bool BleSyncManager::applyPositionJson(const String &body, String &error) {
     error = "Missing wordIndex";
     return false;
   }
-  return dataStore_->writePosition(hash, wordIndex);
+  // Capture the write request; the actual NVS write + listener fire on the
+  // Arduino loop task via update(). Keeping it off the NimBLE host task
+  // avoids stalls when the listener does work (e.g. seeking the live reader).
+  pendingPositionHash_ = hash;
+  pendingPositionWord_ = wordIndex;
+  pendingPosition_ = true;
+  return true;
 }
 
 void BleSyncManager::onTransferWrite(const uint8_t *bytes, size_t len) {
@@ -482,6 +540,24 @@ void BleSyncManager::onTransferWrite(const uint8_t *bytes, size_t len) {
       upload_.pendingFinish = true;
     }
   }
+}
+
+void BleSyncManager::onDeleteWrite(const uint8_t *bytes, size_t len) {
+  if (bytes == nullptr || len == 0) {
+    return;
+  }
+  String body;
+  body.reserve(len);
+  for (size_t i = 0; i < len; ++i) {
+    body += static_cast<char>(bytes[i]);
+  }
+  String hash;
+  if (!readJsonString(body, "hash", hash) || hash.isEmpty()) {
+    Serial.printf("[ble-delete] bad payload: %s\n", body.c_str());
+    return;
+  }
+  pendingDeleteHash_ = hash;
+  pendingDelete_ = true;
 }
 
 void BleSyncManager::resetUpload() {

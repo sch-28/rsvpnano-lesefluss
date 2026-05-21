@@ -67,6 +67,20 @@ class RsvpDataStore {
   bool finishUpload(bool success);
   String lastUploadedPath() const { return lastUploadedPath_; }
 
+  // Remove the book identified by `hash` from SD and clear its NVS
+  // position/word-count keys. Idempotent: returns false when the hash does
+  // not resolve to a known book, true when the file was successfully removed.
+  // If the deleted book was the device's active book, clears the active key.
+  bool deleteBook(const String &hash);
+
+  // Settings JSON wire format matches the HTTP /api/settings endpoint, so
+  // either transport can read and patch the same NVS-backed store.
+  // `settingsJson()` always returns a fully-populated envelope on success.
+  // `applySettingsJson()` accepts a partial patch; missing fields are left
+  // untouched. Validation errors set `error` and return false.
+  String settingsJson();
+  bool applySettingsJson(const String &body, String &error);
+
  private:
   static String bookPositionKey(const String &hash);
   static String bookWordCountKey(const String &hash);
