@@ -1,19 +1,19 @@
 const FLASH_KEY = "rsvpnano_last_flash";
 
 function timeAgo(ts) {
-  const s = Math.floor((Date.now() - ts) / 1000);
-  if (s < 60) return "just now";
-  const m = Math.floor(s / 60);
-  if (m < 60) return m + (m === 1 ? " minute ago" : " minutes ago");
-  const h = Math.floor(m / 60);
-  if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
-  const d = Math.floor(h / 24);
-  return d + (d === 1 ? " day ago" : " days ago");
+	const s = Math.floor((Date.now() - ts) / 1000);
+	if (s < 60) return "just now";
+	const m = Math.floor(s / 60);
+	if (m < 60) return m + (m === 1 ? " minute ago" : " minutes ago");
+	const h = Math.floor(m / 60);
+	if (h < 24) return h + (h === 1 ? " hour ago" : " hours ago");
+	const d = Math.floor(h / 24);
+	return d + (d === 1 ? " day ago" : " days ago");
 }
 
 class InstallFirmware extends HTMLElement {
-  connectedCallback() {
-    this.innerHTML = `
+	connectedCallback() {
+		this.innerHTML = `
       <section class="card install-steps" id="install-section">
         <button class="section-header" id="install-toggle" type="button" aria-expanded="true">
           <div style="flex:1;display:flex;align-items:center;gap:10px">
@@ -53,97 +53,103 @@ class InstallFirmware extends HTMLElement {
       </section>
     `;
 
-    this._section = this.querySelector("#install-section");
-    this._historyEl = this.querySelector("#flash-history");
+		this._section = this.querySelector("#install-section");
+		this._historyEl = this.querySelector("#flash-history");
 
-    this.querySelector("#install-toggle").addEventListener("click", () => {
-      this._section.classList.toggle("is-collapsed");
-      this.querySelector("#install-toggle").setAttribute(
-        "aria-expanded",
-        this._section.classList.contains("is-collapsed") ? "false" : "true",
-      );
-    });
+		this.querySelector("#install-toggle").addEventListener("click", () => {
+			this._section.classList.toggle("is-collapsed");
+			this.querySelector("#install-toggle").setAttribute(
+				"aria-expanded",
+				this._section.classList.contains("is-collapsed") ? "false" : "true",
+			);
+		});
 
-    this._showFlashHistory();
-    this._autoCollapse();
-    this._observeInstallDialog();
+		this._showFlashHistory();
+		this._autoCollapse();
+		this._observeInstallDialog();
 
-    fetch("firmware/manifest.json")
-      .then(r => r.json())
-      .then(m => {
-        this._fwVersion = m.version;
-        this.querySelector(".fw-version").textContent = "Version " + m.version;
-        if (m.features) {
-          const ul = this.querySelector(".feature-list");
-          ul.innerHTML = m.features.map(f => "<li>" + f + "</li>").join("");
-        }
-        this._updateButtonText();
-      });
-  }
+		fetch("firmware/manifest.json")
+			.then((r) => r.json())
+			.then((m) => {
+				this._fwVersion = m.version;
+				this.querySelector(".fw-version").textContent = "Version " + m.version;
+				if (m.features) {
+					const ul = this.querySelector(".feature-list");
+					ul.innerHTML = m.features.map((f) => "<li>" + f + "</li>").join("");
+				}
+				this._updateButtonText();
+			});
+	}
 
-  _showFlashHistory() {
-    try {
-      const data = JSON.parse(localStorage.getItem(FLASH_KEY));
-      if (data && data.timestamp) {
-        const versionLabel = data.version ? data.version + " " : "";
-        this._historyEl.textContent = versionLabel + "flashed " + timeAgo(data.timestamp);
-      } else {
-        this._historyEl.textContent = "No installations in history";
-      }
-    } catch (e) {
-      this._historyEl.textContent = "No installations in history";
-    }
-  }
+	_showFlashHistory() {
+		try {
+			const data = JSON.parse(localStorage.getItem(FLASH_KEY));
+			if (data && data.timestamp) {
+				const versionLabel = data.version ? data.version + " " : "";
+				this._historyEl.textContent = versionLabel + "flashed " + timeAgo(data.timestamp);
+			} else {
+				this._historyEl.textContent = "No installations in history";
+			}
+		} catch (e) {
+			this._historyEl.textContent = "No installations in history";
+		}
+	}
 
-  _autoCollapse() {
-    try {
-      const data = JSON.parse(localStorage.getItem(FLASH_KEY));
-      if (data && data.timestamp) {
-        this._section.classList.add("is-collapsed");
-        this.querySelector("#install-toggle").setAttribute("aria-expanded", "false");
-      }
-    } catch (e) {}
-  }
+	_autoCollapse() {
+		try {
+			const data = JSON.parse(localStorage.getItem(FLASH_KEY));
+			if (data && data.timestamp) {
+				this._section.classList.add("is-collapsed");
+				this.querySelector("#install-toggle").setAttribute("aria-expanded", "false");
+			}
+		} catch (e) {}
+	}
 
-  _updateButtonText() {
-    try {
-      const data = JSON.parse(localStorage.getItem(FLASH_KEY));
-      if (data && data.version && this._fwVersion && data.version !== this._fwVersion) {
-        const btn = this.querySelector('button[slot="activate"]');
-        if (btn) btn.textContent = "Update Firmware";
-      }
-    } catch (e) {}
-  }
+	_updateButtonText() {
+		try {
+			const data = JSON.parse(localStorage.getItem(FLASH_KEY));
+			if (data && data.version && this._fwVersion && data.version !== this._fwVersion) {
+				const btn = this.querySelector('button[slot="activate"]');
+				if (btn) btn.textContent = "Update Firmware";
+			}
+		} catch (e) {}
+	}
 
-  _observeInstallDialog() {
-    new MutationObserver((mutations) => {
-      mutations.forEach((m) => {
-        m.addedNodes.forEach((node) => {
-          if (node.nodeName !== "EWT-INSTALL-DIALOG") return;
+	_observeInstallDialog() {
+		new MutationObserver((mutations) => {
+			mutations.forEach((m) => {
+				m.addedNodes.forEach((node) => {
+					if (node.nodeName !== "EWT-INSTALL-DIALOG") return;
 
-          let saved = false;
-          const pollTimer = setInterval(() => {
-            if (!document.body.contains(node)) { clearInterval(pollTimer); return; }
-            if (saved) return;
-            try {
-              const text = node.shadowRoot?.textContent || "";
-              if (text.indexOf("Installation complete") !== -1) {
-                saved = true;
-                clearInterval(pollTimer);
-                localStorage.setItem(FLASH_KEY, JSON.stringify({
-                  version: this._fwVersion,
-                  timestamp: Date.now(),
-                }));
-                this._showFlashHistory();
-              }
-            } catch (e) {}
-          }, 500);
+					let saved = false;
+					const pollTimer = setInterval(() => {
+						if (!document.body.contains(node)) {
+							clearInterval(pollTimer);
+							return;
+						}
+						if (saved) return;
+						try {
+							const text = node.shadowRoot?.textContent || "";
+							if (text.indexOf("Installation complete") !== -1) {
+								saved = true;
+								clearInterval(pollTimer);
+								localStorage.setItem(
+									FLASH_KEY,
+									JSON.stringify({
+										version: this._fwVersion,
+										timestamp: Date.now(),
+									}),
+								);
+								this._showFlashHistory();
+							}
+						} catch (e) {}
+					}, 500);
 
-          setTimeout(() => clearInterval(pollTimer), 600000);
-        });
-      });
-    }).observe(document.body, { childList: true });
-  }
+					setTimeout(() => clearInterval(pollTimer), 600000);
+				});
+			});
+		}).observe(document.body, { childList: true });
+	}
 }
 
 customElements.define("install-firmware", InstallFirmware);

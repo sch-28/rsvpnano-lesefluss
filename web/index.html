@@ -989,7 +989,7 @@
     <script>
       if (!("serial" in navigator)) {
         document.getElementById("compat-modal").hidden = false;
-        document.getElementById("compat-dismiss").addEventListener("click", function () {
+        document.getElementById("compat-dismiss").addEventListener("click", () => {
           document.getElementById("compat-modal").hidden = true;
         });
       }
@@ -1014,7 +1014,7 @@
         }
 
         setSectionCollapsed(sectionId, collapsed);
-        toggle.addEventListener("click", function () {
+        toggle.addEventListener("click", () => {
           const section = document.getElementById(sectionId);
           setSectionCollapsed(sectionId, !section.classList.contains("is-collapsed"));
         });
