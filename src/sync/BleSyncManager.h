@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <NimBLEDevice.h>
+#include <freertos/FreeRTOS.h>
 
 #include <functional>
 #include <vector>
@@ -21,6 +22,10 @@ class BleSyncManager {
   // app pushes a position write that names the device's currently-active
   // book hash. Listener should seek the live reader to wordIndex.
   using PositionListener = std::function<void(const String &hash, uint32_t wordIndex)>;
+  // Fired on the Arduino loop task when the app writes a new active hash via
+  // the multibook `active` characteristic. Listener should open the book on
+  // the device's reader.
+  using ActiveListener = std::function<void(const String &hash)>;
 
   bool begin(RsvpDataStore &dataStore);
   void update();
@@ -28,6 +33,7 @@ class BleSyncManager {
   bool active() const { return active_; }
 
   void setPositionListener(PositionListener listener) { positionListener_ = std::move(listener); }
+  void setActiveListener(ActiveListener listener) { activeListener_ = std::move(listener); }
 
  private:
   // SD-touching steps run on the Arduino loop task, not the NimBLE host task.
@@ -91,6 +97,18 @@ class BleSyncManager {
   String pendingPositionHash_;
   uint32_t pendingPositionWord_ = 0;
   PositionListener positionListener_;
+  // Pending active-hash write captured by the NimBLE host task. Drained on
+  // the Arduino loop task so the listener (which opens books on SD) doesn't
+  // run on the BLE callback.
+  bool pendingActive_ = false;
+  String pendingActiveHash_;
+  ActiveListener activeListener_;
   bool active_ = false;
   uint32_t lastStatusLogMs_ = 0;
+  // Guards concurrent access to upload_.pendingBytes + bytesReceived between
+  // the NimBLE host task (onWrite inserts) and the Arduino loop task (drains
+  // + clears). Without this the drain's read-then-clear can race with a
+  // mid-insert, silently dropping bytes — chunks arrive over BLE, get counted
+  // in bytesReceived (so ACK:END fires), but never land on SD.
+  portMUX_TYPE uploadMux_ = portMUX_INITIALIZER_UNLOCKED;
 };

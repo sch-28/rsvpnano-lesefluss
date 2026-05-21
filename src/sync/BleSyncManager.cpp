@@ -342,6 +342,16 @@ void BleSyncManager::update() {
     }
   }
 
+  if (pendingActive_) {
+    const String hash = pendingActiveHash_;
+    pendingActive_ = false;
+    pendingActiveHash_ = "";
+    Serial.printf("[ble-active] open hash=%s\n", hash.c_str());
+    if (activeListener_) {
+      activeListener_(hash);
+    }
+  }
+
   // Drain any SD work captured by the NimBLE write callback.
   if (upload_.pendingHeader) {
     upload_.pendingHeader = false;
@@ -359,23 +369,31 @@ void BleSyncManager::update() {
     }
   }
 
-  if (upload_.inProgress && !upload_.pendingBytes.empty()) {
-    const uint32_t beforeWrite = millis();
-    const bool ok = dataStore_->appendUpload(upload_.pendingBytes.data(),
-                                              upload_.pendingBytes.size());
-    const uint32_t writeMs = millis() - beforeWrite;
-    if (writeMs > 20) {
-      Serial.printf("[ble-xfer] slow SD write %u ms\n", static_cast<unsigned>(writeMs));
+  if (upload_.inProgress) {
+    // Swap-and-drain: atomically take ownership of the pending buffer so SD
+    // writes happen outside the critical section. Any concurrent NimBLE
+    // callback inserts go into the new (empty) vector and are picked up next
+    // tick.
+    std::vector<uint8_t> drain;
+    portENTER_CRITICAL(&uploadMux_);
+    drain.swap(upload_.pendingBytes);
+    portEXIT_CRITICAL(&uploadMux_);
+    if (!drain.empty()) {
+      const uint32_t beforeWrite = millis();
+      const bool ok = dataStore_->appendUpload(drain.data(), drain.size());
+      const uint32_t writeMs = millis() - beforeWrite;
+      if (writeMs > 20) {
+        Serial.printf("[ble-xfer] slow SD write %u ms\n", static_cast<unsigned>(writeMs));
+      }
+      if (!ok) {
+        Serial.printf("[ble-xfer] appendUpload failed at offset %u\n",
+                      static_cast<unsigned>(upload_.bytesReceived));
+        dataStore_->finishUpload(false);
+        resetUpload();
+        notifyTransfer("NACK:WRITE:io");
+        return;
+      }
     }
-    if (!ok) {
-      Serial.printf("[ble-xfer] appendUpload failed at offset %u\n",
-                    static_cast<unsigned>(upload_.bytesReceived));
-      dataStore_->finishUpload(false);
-      resetUpload();
-      notifyTransfer("NACK:WRITE:io");
-      return;
-    }
-    upload_.pendingBytes.clear();
   }
 
   if (upload_.pendingFinish) {
@@ -479,6 +497,10 @@ bool BleSyncManager::applyActiveHash(const String &hash, String &error) {
   // the next BLE write. Caller is trusted to provide a valid hash; on next
   // reader-open the device will surface "book not found" if it isn't.
   dataStore_->setActiveBookHash(hash);
+  // Defer the open-book call to the Arduino loop task — opening a book runs
+  // an SD index build on first read, which would block the BLE host.
+  pendingActiveHash_ = hash;
+  pendingActive_ = true;
   return true;
 }
 
@@ -538,11 +560,13 @@ void BleSyncManager::onTransferWrite(const uint8_t *bytes, size_t len) {
   }
 
   if (upload_.inProgress) {
+    portENTER_CRITICAL(&uploadMux_);
     upload_.pendingBytes.insert(upload_.pendingBytes.end(), bytes, bytes + len);
     upload_.bytesReceived += len;
     if (upload_.bytesExpected > 0 && upload_.bytesReceived >= upload_.bytesExpected) {
       upload_.pendingFinish = true;
     }
+    portEXIT_CRITICAL(&uploadMux_);
   }
 }
 

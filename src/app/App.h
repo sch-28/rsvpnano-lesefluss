@@ -46,6 +46,10 @@ class App {
   // tracker so the next save doesn't overwrite with a stale value.
   void onBlePositionUpdate(const String &hash, uint32_t wordIndex);
 
+  // Called when the app writes a new hash to the multibook `active`
+  // characteristic. Opens the matching book on the device's reader.
+  void onBleActiveBookChange(const String &hash);
+
  private:
   static constexpr size_t kOtaVersionLabelMax = 32;
   static constexpr size_t kOtaSummaryLabelMax = 40;

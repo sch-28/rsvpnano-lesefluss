@@ -751,6 +751,7 @@ void App::begin() {
   Serial.printf("[boot] data store ready=%d\n", dataStoreOk);
   bleSync_.setPositionListener(
       [this](const String &hash, uint32_t wordIndex) { onBlePositionUpdate(hash, wordIndex); });
+  bleSync_.setActiveListener([this](const String &hash) { onBleActiveBookChange(hash); });
   const bool bleOk = bleSync_.begin(dataStore_);
   Serial.printf("[boot] ble ready=%d\n", bleOk);
   const uint16_t savedWpm = preferences_.getUShort(kPrefWpm, reader_.wpm());
@@ -5012,6 +5013,40 @@ void App::onBlePositionUpdate(const String &hash, uint32_t wordIndex) {
                 static_cast<unsigned>(reader_.currentIndex()),
                 static_cast<unsigned>(lastSavedWordIndex_),
                 (state_ == AppState::Playing || state_ == AppState::Paused) ? 1 : 0);
+}
+
+void App::onBleActiveBookChange(const String &hash) {
+  if (hash.isEmpty()) {
+    Serial.println("[ble-active] empty hash, ignoring");
+    return;
+  }
+  const String path = dataStore_.resolvePathByHash(hash);
+  if (path.isEmpty()) {
+    Serial.printf("[ble-active] hash=%s not found on SD\n", hash.c_str());
+    return;
+  }
+  int index = findBookIndexByPath(path);
+  if (index < 0) {
+    // Fresh upload: SD has the file but the in-memory inventory was scanned
+    // before it landed. Rescan and retry once.
+    Serial.printf("[ble-active] path %s not in storage_ index, refreshing\n", path.c_str());
+    storage_.refreshBooks();
+    index = findBookIndexByPath(path);
+    if (index < 0) {
+      Serial.printf("[ble-active] still not found after refresh\n");
+      return;
+    }
+  }
+  // Persist current book's position before swapping.
+  saveReadingPosition(true);
+  const uint32_t nowMs = millis();
+  if (!loadBookAtIndex(static_cast<size_t>(index), nowMs)) {
+    Serial.printf("[ble-active] loadBookAtIndex failed for %s\n", path.c_str());
+    return;
+  }
+  setState(AppState::Paused, nowMs);
+  renderActiveReader(nowMs);
+  Serial.printf("[ble-active] opened book at index=%d path=%s\n", index, path.c_str());
 }
 
 String App::bookPositionKey(const String &bookPath) const {
