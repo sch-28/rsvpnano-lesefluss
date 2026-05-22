@@ -5003,7 +5003,7 @@ void App::onBlePositionUpdate(const String &hash, uint32_t wordIndex) {
   // doesn't try to write a stale `reader_.currentIndex()` over the just-pushed
   // value.
   lastSavedWordIndex_ = target;
-  // Force a redraw — in Paused/Menu the main loop does not auto-render, so the
+  // Force a redraw. In Paused/Menu the main loop does not auto-render, so the
   // device would otherwise stay frozen on the old word until the user touches
   // the screen.
   if (state_ == AppState::Playing || state_ == AppState::Paused) {

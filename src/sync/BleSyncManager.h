@@ -108,7 +108,7 @@ class BleSyncManager {
   // Guards concurrent access to upload_.pendingBytes + bytesReceived between
   // the NimBLE host task (onWrite inserts) and the Arduino loop task (drains
   // + clears). Without this the drain's read-then-clear can race with a
-  // mid-insert, silently dropping bytes — chunks arrive over BLE, get counted
+  // mid-insert, silently dropping bytes. Chunks arrive over BLE, get counted
   // in bytesReceived (so ACK:END fires), but never land on SD.
   portMUX_TYPE uploadMux_ = portMUX_INITIALIZER_UNLOCKED;
 };

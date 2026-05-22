@@ -370,15 +370,28 @@ void BleSyncManager::update() {
   }
 
   if (upload_.inProgress) {
-    // Swap-and-drain: atomically take ownership of the pending buffer so SD
-    // writes happen outside the critical section. Any concurrent NimBLE
-    // callback inserts go into the new (empty) vector and are picked up next
-    // tick.
-    std::vector<uint8_t> drain;
-    portENTER_CRITICAL(&uploadMux_);
-    drain.swap(upload_.pendingBytes);
-    portEXIT_CRITICAL(&uploadMux_);
-    if (!drain.empty()) {
+    // Swap-and-drain + finish detection under a single critical-section
+    // invariant: `finish` is set only when the swap returned an empty buffer
+    // AT THE SAME mutex acquisition as the pendingFinish read. The callback
+    // sets pendingBytes insert + bytesReceived + pendingFinish inside one
+    // critical section, so if pendingFinish is true we either have the last
+    // chunk in this swap (finish=false this iteration, true next) or the
+    // last chunk was already drained previously (pendingBytes empty,
+    // finish=true now). Without the empty-check the finishUpload below
+    // could close the file while the tail chunk still sat in pendingBytes,
+    // silently dropping the last bytes of every upload.
+    bool finish = false;
+    bool writeFailed = false;
+    while (true) {
+      std::vector<uint8_t> drain;
+      portENTER_CRITICAL(&uploadMux_);
+      drain.swap(upload_.pendingBytes);
+      if (drain.empty() && upload_.pendingFinish) {
+        upload_.pendingFinish = false;
+        finish = true;
+      }
+      portEXIT_CRITICAL(&uploadMux_);
+      if (drain.empty()) break;
       const uint32_t beforeWrite = millis();
       const bool ok = dataStore_->appendUpload(drain.data(), drain.size());
       const uint32_t writeMs = millis() - beforeWrite;
@@ -391,17 +404,17 @@ void BleSyncManager::update() {
         dataStore_->finishUpload(false);
         resetUpload();
         notifyTransfer("NACK:WRITE:io");
-        return;
+        writeFailed = true;
+        break;
       }
     }
-  }
-
-  if (upload_.pendingFinish) {
-    upload_.pendingFinish = false;
-    const bool ok = dataStore_->finishUpload(true);
-    Serial.printf("[ble-xfer] finishUpload ok=%d\n", ok);
-    resetUpload();
-    notifyTransfer(ok ? "ACK:END" : "NACK:END:rename");
+    if (writeFailed) return;
+    if (finish) {
+      const bool ok = dataStore_->finishUpload(true);
+      Serial.printf("[ble-xfer] finishUpload ok=%d\n", ok);
+      resetUpload();
+      notifyTransfer(ok ? "ACK:END" : "NACK:END:rename");
+    }
   }
 
   const uint32_t now = millis();
@@ -497,7 +510,7 @@ bool BleSyncManager::applyActiveHash(const String &hash, String &error) {
   // the next BLE write. Caller is trusted to provide a valid hash; on next
   // reader-open the device will surface "book not found" if it isn't.
   dataStore_->setActiveBookHash(hash);
-  // Defer the open-book call to the Arduino loop task — opening a book runs
+  // Defer the open-book call to the Arduino loop task. Opening a book runs
   // an SD index build on first read, which would block the BLE host.
   pendingActiveHash_ = hash;
   pendingActive_ = true;
