@@ -4,6 +4,7 @@
 #include <FS.h>
 #include <Preferences.h>
 
+#include <atomic>
 #include <vector>
 
 // Shared data layer for HTTP companion sync and BLE GATT sync.
@@ -81,6 +82,9 @@ class RsvpDataStore {
   String settingsJson();
   bool applySettingsJson(const String &body, String &error);
 
+  bool bleEnabled();
+  void setBleEnabled(bool enabled);
+
  private:
   static String bookPositionKey(const String &hash);
   static String bookWordCountKey(const String &hash);
@@ -95,6 +99,10 @@ class RsvpDataStore {
 
   Preferences preferences_;
   bool began_ = false;
+  // Atomic mirror of kPrefBleEnabled so callers can poll the flag without
+  // touching NVS. Concurrent NVS reads from the loop task while the NimBLE
+  // host task writes other keys (e.g. setActiveBookHash) hangs the loop.
+  std::atomic<bool> bleEnabledCache_{false};
 
   File uploadFile_;
   String uploadFinalPath_;

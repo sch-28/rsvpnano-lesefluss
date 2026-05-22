@@ -1095,6 +1095,10 @@ String CompanionSyncManager::settingsJson() {
   body += ",\"guideWidth\":" + String(guideWidth);
   body += ",\"guideGap\":" + String(guideGap);
   body += "}";
+  body += ",\"connectivity\":{";
+  body += "\"bleEnabled\":" +
+          String(preferences_.getBool("ble_on", false) ? "true" : "false");
+  body += "}";
   body += ",\"limits\":{";
   body += "\"wpm\":{\"min\":" + String(kMinWpm) + ",\"max\":" + String(kMaxWpm) + "}";
   body += ",\"brightnessIndex\":{\"min\":0,\"max\":" + String(kMaxBrightness) + "}";
@@ -1275,6 +1279,10 @@ bool CompanionSyncManager::applySettingsJson(const String &body, String &error) 
     }
     preferences_.putUChar(kPrefTypographyGuideGap, static_cast<uint8_t>(intValue));
   }
+  // bleEnabled intentionally not handled here: this writer uses its own
+  // Preferences instance, so a direct write would leave RsvpDataStore's
+  // atomic cache stale. Clients should patch bleEnabled via the BLE
+  // settings characteristic instead.
 
   return true;
 }

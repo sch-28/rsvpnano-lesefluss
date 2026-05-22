@@ -4,33 +4,30 @@
 #include <NimBLEDevice.h>
 #include <freertos/FreeRTOS.h>
 
+#include <atomic>
 #include <functional>
 #include <vector>
 
 #include "storage/RsvpDataStore.h"
 
-// NimBLE GATT server exposing the multibook BLE schema defined in
-// packages/ble-config/config-multibook.json. Acts as a second front-end
-// onto RsvpDataStore, alongside the existing WiFi-AP HTTP CompanionSync.
-//
-// Single-connection by design for v1. Chunked book transfer state lives
-// on this manager (not per-connection) since only one peer transfers at
-// a time.
+// NimBLE GATT server exposing the multibook BLE schema. Single-connection
+// by design; chunked transfer state lives on the manager.
 class BleSyncManager {
  public:
-  // Fired on the Arduino loop task (not the NimBLE host task) whenever the
-  // app pushes a position write that names the device's currently-active
-  // book hash. Listener should seek the live reader to wordIndex.
+  // Fired on the Arduino loop task when a peer writes a position update for
+  // the device's currently-active book. Listener should seek the live reader.
   using PositionListener = std::function<void(const String &hash, uint32_t wordIndex)>;
-  // Fired on the Arduino loop task when the app writes a new active hash via
-  // the multibook `active` characteristic. Listener should open the book on
-  // the device's reader.
+  // Fired on the Arduino loop task when a peer writes a new active hash.
+  // Listener should open the book on the device's reader.
   using ActiveListener = std::function<void(const String &hash)>;
 
   bool begin(RsvpDataStore &dataStore);
   void update();
+  // Returns immediately; disconnect + NimBLE deinit run across multiple
+  // update() ticks. Safe to call from any context. Poll active() to know
+  // when teardown completes.
   void end();
-  bool active() const { return active_; }
+  bool active() const { return active_.load(std::memory_order_acquire); }
 
   void setPositionListener(PositionListener listener) { positionListener_ = std::move(listener); }
   void setActiveListener(ActiveListener listener) { activeListener_ = std::move(listener); }
@@ -73,6 +70,21 @@ class BleSyncManager {
   void resetUpload();
   void notifyTransfer(const char *msg);
 
+ public:
+  // Emit a position update over the position characteristic so subscribed
+  // peers see device-side reader advances in real time. No-op when inactive.
+  void notifyPosition(const String &hash, uint32_t wordIndex);
+
+ private:
+  // Library notify stream is split across multiple update() ticks to avoid
+  // blocking the reader loop. start: build payload + CRC, send HDR. advance:
+  // one DATA frame per tick, then END.
+  void startLibraryStream(uint16_t connHandle);
+  void advanceLibraryStream();
+  // Multi-tick teardown driver. No vTaskDelay; uses millis() so the loop
+  // task never blocks.
+  void tickShutdown();
+
   RsvpDataStore *dataStore_ = nullptr;
   NimBLEServer *server_ = nullptr;
   NimBLECharacteristic *infoChar_ = nullptr;
@@ -85,30 +97,43 @@ class BleSyncManager {
   NimBLECharacteristic *deleteChar_ = nullptr;
 
   UploadState upload_;
-  // Pending delete request captured by the NimBLE write callback; drained on
-  // the Arduino loop task by update() so SD remove + NVS writes don't run on
-  // the BLE host task.
-  bool pendingDelete_ = false;
+  // Pending writes captured by NimBLE host callbacks; drained on the Arduino
+  // loop task in update() so SD/NVS/listener work runs off the BLE host task.
+  // Release/acquire pairs publish the associated data fields safely.
+  std::atomic<bool> pendingDelete_{false};
   String pendingDeleteHash_;
-  // Pending position write captured by the NimBLE host task. Drained on the
-  // Arduino loop task so the NVS write + reader-seek listener fire away from
-  // BLE callback context.
-  bool pendingPosition_ = false;
+  std::atomic<bool> pendingPosition_{false};
   String pendingPositionHash_;
   uint32_t pendingPositionWord_ = 0;
   PositionListener positionListener_;
-  // Pending active-hash write captured by the NimBLE host task. Drained on
-  // the Arduino loop task so the listener (which opens books on SD) doesn't
-  // run on the BLE callback.
-  bool pendingActive_ = false;
+  std::atomic<bool> pendingActive_{false};
   String pendingActiveHash_;
   ActiveListener activeListener_;
-  bool active_ = false;
+  std::atomic<bool> pendingLibraryFetch_{false};
+  std::atomic<uint16_t> pendingLibraryConnHandle_{0xFFFF};
+  // Rate-limit position notifies; reader saves can fire at WPM rate, but the
+  // peer doesn't need every advance. Caps wire traffic + reduces contention
+  // with library/transfer notifies on the NimBLE mbuf pool.
+  uint32_t lastPositionNotifyMs_ = 0;
+  struct LibraryStream {
+    bool active = false;
+    String payload;
+    uint32_t len = 0;
+    uint32_t crc = 0;
+    uint32_t totalChunks = 0;
+    uint32_t nextSeq = 0;
+    uint32_t chunkSize = 0;
+    uint32_t lastEmitMs = 0;
+    bool endPending = false;
+  };
+  LibraryStream libStream_;
+  enum class ShutdownPhase : uint8_t { Idle, DisconnectIssued, AwaitingDrain, Deinit };
+  ShutdownPhase shutdownPhase_ = ShutdownPhase::Idle;
+  uint32_t shutdownPhaseStartedMs_ = 0;
+  std::atomic<bool> active_{false};
   uint32_t lastStatusLogMs_ = 0;
-  // Guards concurrent access to upload_.pendingBytes + bytesReceived between
-  // the NimBLE host task (onWrite inserts) and the Arduino loop task (drains
-  // + clears). Without this the drain's read-then-clear can race with a
-  // mid-insert, silently dropping bytes. Chunks arrive over BLE, get counted
-  // in bytesReceived (so ACK:END fires), but never land on SD.
+  // Without this critical section the drain's read-then-clear races with the
+  // NimBLE host task's mid-insert, silently dropping body bytes: chunks get
+  // counted in bytesReceived (ACK:END fires) but never land on SD.
   portMUX_TYPE uploadMux_ = portMUX_INITIALIZER_UNLOCKED;
 };

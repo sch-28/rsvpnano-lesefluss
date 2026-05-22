@@ -6,7 +6,7 @@
 
 namespace lesefluss::ble {
 
-constexpr int PROTOCOL_VERSION = 1;
+constexpr int PROTOCOL_VERSION = 2;
 constexpr const char* DEVICE_NAME = "RSVP Nano";
 constexpr const char* SERVICE_UUID = "58fc3a69-6f17-45e2-a9d1-575f33a76219";
 constexpr const char* INFO_CHAR_UUID = "3249061a-2d65-434b-b710-0c701985a0ce";

@@ -11,7 +11,7 @@ constexpr size_t kMaxMetadataLineChars = 160;
 
 // Settings NVS keys + bounds. Mirror of the constants in
 // CompanionSyncManager.cpp; both modules must agree on these strings since
-// they read and write the same NVS namespace. TASK-140 will consolidate.
+// they read and write the same NVS namespace.
 constexpr const char *kPrefWpm = "wpm";
 constexpr const char *kPrefBrightness = "bright";
 constexpr const char *kPrefDarkMode = "dark";
@@ -37,6 +37,7 @@ constexpr const char *kPrefTypographyTracking = "type_trk";
 constexpr const char *kPrefTypographyAnchor = "type_anc";
 constexpr const char *kPrefTypographyGuideWidth = "type_wid";
 constexpr const char *kPrefTypographyGuideGap = "type_gap";
+constexpr const char *kPrefBleEnabled = "ble_on";
 
 constexpr uint16_t kDefaultWpm = 300;
 constexpr uint16_t kMinWpm = 10;
@@ -225,6 +226,8 @@ bool RsvpDataStore::begin() {
     return false;
   }
   began_ = true;
+  bleEnabledCache_.store(preferences_.getBool(kPrefBleEnabled, false),
+                         std::memory_order_release);
   return true;
 }
 
@@ -637,6 +640,10 @@ String RsvpDataStore::settingsJson() {
   body += ",\"guideWidth\":" + String(guideWidth);
   body += ",\"guideGap\":" + String(guideGap);
   body += "}";
+  body += ",\"connectivity\":{";
+  body += "\"bleEnabled\":" +
+          String(preferences_.getBool(kPrefBleEnabled, false) ? "true" : "false");
+  body += "}";
   body += ",\"limits\":{";
   body += "\"wpm\":{\"min\":" + String(kMinWpm) + ",\"max\":" + String(kMaxWpm) + "}";
   body += ",\"brightnessIndex\":{\"min\":0,\"max\":" + String(kMaxBrightness) + "}";
@@ -774,7 +781,22 @@ bool RsvpDataStore::applySettingsJson(const String &body, String &error) {
     }
     preferences_.putUChar(kPrefTypographyGuideGap, static_cast<uint8_t>(intValue));
   }
+  if (readJsonBool(body, "bleEnabled", boolValue)) {
+    setBleEnabled(boolValue);
+  }
   return true;
+}
+
+bool RsvpDataStore::bleEnabled() {
+  return bleEnabledCache_.load(std::memory_order_acquire);
+}
+
+void RsvpDataStore::setBleEnabled(bool enabled) {
+  if (!began_) {
+    return;
+  }
+  preferences_.putBool(kPrefBleEnabled, enabled);
+  bleEnabledCache_.store(enabled, std::memory_order_release);
 }
 
 RsvpDataStore::StorageInfo RsvpDataStore::storage() {

@@ -180,6 +180,10 @@ constexpr size_t kWifiSettingsChooseIndex = 2;
 constexpr size_t kWifiSettingsAutoUpdateIndex = 3;
 constexpr size_t kWifiSettingsForgetIndex = 4;
 constexpr size_t kWifiSettingsOtaOwnerIndex = 5;
+constexpr size_t kWifiSettingsBleToggleIndex = 6;
+constexpr size_t kWifiSettingsItemCount = 7;
+static_assert(kWifiSettingsItemCount == kWifiSettingsBleToggleIndex + 1,
+              "kWifiSettingsItemCount must equal the highest WifiSettings index + 1");
 
 constexpr size_t kBookPickerBackIndex = 0;
 constexpr size_t kChapterPickerBackIndex = 0;
@@ -752,8 +756,16 @@ void App::begin() {
   bleSync_.setPositionListener(
       [this](const String &hash, uint32_t wordIndex) { onBlePositionUpdate(hash, wordIndex); });
   bleSync_.setActiveListener([this](const String &hash) { onBleActiveBookChange(hash); });
-  const bool bleOk = bleSync_.begin(dataStore_);
-  Serial.printf("[boot] ble ready=%d\n", bleOk);
+  if (!dataStoreOk) {
+    Serial.println("[boot] ble skipped (dataStore not ready)");
+  } else if (dataStore_.bleEnabled()) {
+    bleEnabledLastSeen_ = true;
+    const bool bleOk = bleSync_.begin(dataStore_);
+    Serial.printf("[boot] ble ready=%d\n", bleOk);
+  } else {
+    bleEnabledLastSeen_ = false;
+    Serial.println("[boot] ble disabled");
+  }
   const uint16_t savedWpm = preferences_.getUShort(kPrefWpm, reader_.wpm());
   reader_.setWpm(savedWpm);
 
@@ -787,6 +799,7 @@ void App::update(uint32_t nowMs) {
   button_.update(nowMs);
   powerButton_.update(nowMs);
   bleSync_.update();
+  reconcileBleEnabled();
   const bool standbyComboConsumed = handleStandbyCombo(nowMs);
   if (!standbyComboConsumed) {
     handleBootButton(nowMs);
@@ -2886,8 +2899,41 @@ void App::selectWifiSettingsItem(uint32_t nowMs) {
                     preferences_.getString(kPrefOtaOwner, ""), "", false, 39,
                     MenuScreen::WifiSettings);
       return;
+    case kWifiSettingsBleToggleIndex:
+      dataStore_.setBleEnabled(!dataStore_.bleEnabled());
+      reconcileBleEnabled();
+      rebuildSettingsMenuItems();
+      renderSettings();
+      return;
     default:
       return;
+  }
+}
+
+void App::reconcileBleEnabled() {
+  const bool desired = dataStore_.bleEnabled();
+  // bleEnabledLastSeen_ cached so a failed begin() doesn't spin: act once
+  // per pref change, leave alone until the pref flips again.
+  if (desired == bleEnabledLastSeen_) {
+    return;
+  }
+  bleEnabledLastSeen_ = desired;
+
+  if (desired) {
+    if (!bleSync_.active()) {
+      const bool ok = bleSync_.begin(dataStore_);
+      Serial.printf("[settings] ble begin ok=%d\n", ok);
+      if (!ok) {
+        dataStore_.setBleEnabled(false);
+        bleEnabledLastSeen_ = false;
+        Serial.println("[settings] ble begin failed; pref rolled back");
+      }
+    }
+  } else {
+    if (bleSync_.active()) {
+      bleSync_.end();
+      Serial.println("[settings] ble end scheduled");
+    }
   }
 }
 
@@ -3403,6 +3449,12 @@ void App::rebuildSettingsMenuItems() {
     settingsMenuItems_.push_back("Auto OTA: " + String(otaAutoCheckEnabled() ? "On" : "Off"));
     settingsMenuItems_.push_back("Forget network");
     settingsMenuItems_.push_back("OTA Owner: " + otaOwnerLabel());
+    settingsMenuItems_.push_back("BLE sync: " + String(dataStore_.bleEnabled() ? "On" : "Off"));
+    if (settingsMenuItems_.size() != kWifiSettingsItemCount) {
+      Serial.printf("[settings] BUG: WifiSettings push count %u != expected %u\n",
+                    static_cast<unsigned>(settingsMenuItems_.size()),
+                    static_cast<unsigned>(kWifiSettingsItemCount));
+    }
   }
 
   if (settingsSelectedIndex_ >= settingsMenuItems_.size()) {
@@ -4869,6 +4921,11 @@ void App::loadPendingBootBook(uint32_t nowMs) {
   renderActiveReader(millis());
 }
 
+// Invariant: currentBookPath_ always names the book bound to reader_ at the
+// time of save. The BLE position notify below sends (hashBookPath, reader
+// index) as one pair; routing it to the wrong book on the client would
+// silently corrupt progress. Any caller that swaps currentBookPath_ must
+// reset the reader through loadBookAtIndex before invoking this.
 void App::saveReadingPosition(bool force) {
   if (!usingStorageBook_ || currentBookPath_.isEmpty()) {
     Serial.printf("[save] SKIP usingStorage=%d pathEmpty=%d force=%d\n",
@@ -4895,6 +4952,11 @@ void App::saveReadingPosition(bool force) {
   lastSavedWordIndex_ = wordIndex;
   Serial.printf("[app] saved position word=%u book=%s\n", static_cast<unsigned int>(wordIndex),
                 currentBookPath_.c_str());
+
+  if (bleSync_.active() && !currentBookPath_.isEmpty()) {
+    bleSync_.notifyPosition(RsvpDataStore::hashBookPath(currentBookPath_),
+                            static_cast<uint32_t>(wordIndex));
+  }
 }
 
 bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPositionFallback,

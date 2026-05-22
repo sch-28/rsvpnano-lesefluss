@@ -249,6 +249,8 @@ class App {
   void cycleTypographyPreviewSample(int direction);
   void rebuildSettingsMenuItems();
   void applyPacingSettings();
+  void reconcileBleEnabled();
+  bool bleEnabledLastSeen_ = false;
   void maybeAutoCheckForUpdates(uint32_t nowMs);
   bool startBackgroundOtaCheck(const OtaUpdater::Config &config);
   static void otaCheckTask(void *params);

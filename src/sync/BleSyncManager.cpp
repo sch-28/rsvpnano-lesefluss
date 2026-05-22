@@ -1,5 +1,7 @@
 #include "sync/BleSyncManager.h"
 
+#include <esp_crc.h>
+
 #include "ble/ble_config.h"
 
 namespace {
@@ -139,8 +141,14 @@ class BleInfoCallbacks : public NimBLECharacteristicCallbacks {
 class BleLibraryCallbacks : public NimBLECharacteristicCallbacks {
  public:
   explicit BleLibraryCallbacks(BleSyncManager *mgr) : mgr_(mgr) {}
-  void onRead(NimBLECharacteristic *chr, NimBLEConnInfo &) override {
-    chr->setValue(mgr_->buildLibraryJson().c_str());
+  // Any write triggers a fetch; the byte content is ignored. Heavy work
+  // happens on the loop task in startLibraryStream.
+  void onWrite(NimBLECharacteristic *, NimBLEConnInfo &connInfo) override {
+    // Handle store (relaxed) must happen-before the flag release-store so
+    // the loop task reads a consistent (handle, flag=true) pair.
+    mgr_->pendingLibraryConnHandle_.store(connInfo.getConnHandle(),
+                                          std::memory_order_relaxed);
+    mgr_->pendingLibraryFetch_.store(true, std::memory_order_release);
   }
 
  private:
@@ -253,7 +261,11 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
   explicit BleServerCallbacks(BleSyncManager *mgr) : mgr_(mgr) {}
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &, int reason) override {
     mgr_->resetUpload();
-    NimBLEDevice::startAdvertising();
+    // Skip re-advertise during teardown. Calling startAdvertising on an
+    // in-flight deinit crashes NimBLE.
+    if (mgr_->active_.load(std::memory_order_acquire)) {
+      NimBLEDevice::startAdvertising();
+    }
   }
 
  private:
@@ -261,8 +273,12 @@ class BleServerCallbacks : public NimBLEServerCallbacks {
 };
 
 bool BleSyncManager::begin(RsvpDataStore &dataStore) {
-  if (active_) {
+  if (active_.load(std::memory_order_acquire)) {
     return true;
+  }
+  // Teardown still owns the NimBLE handles; caller can retry next tick.
+  if (shutdownPhase_ != ShutdownPhase::Idle) {
+    return false;
   }
   dataStore_ = &dataStore;
 
@@ -277,7 +293,11 @@ bool BleSyncManager::begin(RsvpDataStore &dataStore) {
   infoChar_ = service->createCharacteristic(INFO_CHAR_UUID, NIMBLE_PROPERTY::READ);
   infoChar_->setCallbacks(new BleInfoCallbacks(this));
 
-  libraryChar_ = service->createCharacteristic(LIBRARY_CHAR_UUID, NIMBLE_PROPERTY::READ);
+  // Write + notify stream. Single READ truncated at MTU-3, so the client
+  // writes a 1-byte trigger and consumes a tag-framed notify stream instead.
+  libraryChar_ = service->createCharacteristic(
+      LIBRARY_CHAR_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY);
   libraryChar_->setCallbacks(new BleLibraryCallbacks(this));
 
   activeChar_ = service->createCharacteristic(
@@ -285,7 +305,8 @@ bool BleSyncManager::begin(RsvpDataStore &dataStore) {
   activeChar_->setCallbacks(new BleActiveCallbacks(this));
 
   positionChar_ = service->createCharacteristic(
-      POSITION_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+      POSITION_CHAR_UUID,
+      NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
   positionChar_->setCallbacks(new BlePositionCallbacks(this));
 
   transferChar_ = service->createCharacteristic(
@@ -310,28 +331,37 @@ bool BleSyncManager::begin(RsvpDataStore &dataStore) {
   adv->setName(DEVICE_NAME);
   adv->start();
 
-  active_ = true;
+  active_.store(true, std::memory_order_release);
   Serial.printf("[ble] advertising as %s\n", DEVICE_NAME);
   return true;
 }
 
 void BleSyncManager::update() {
-  if (!active_) {
+  // Drive the multi-tick shutdown state machine even when !active_. end()
+  // flipped active_ false on entry to signal "don't re-advertise", but the
+  // actual disconnect → drain → deinit work needs to proceed across ticks.
+  if (shutdownPhase_ != ShutdownPhase::Idle) {
+    tickShutdown();
+    return;
+  }
+  if (!active_.load(std::memory_order_acquire)) {
     return;
   }
 
-  if (pendingDelete_) {
+  // acquire pairs with release in onDeleteWrite: guarantees the hash field
+  // is visible when the flag is observed true.
+  if (pendingDelete_.load(std::memory_order_acquire)) {
     const String hash = pendingDeleteHash_;
-    pendingDelete_ = false;
+    pendingDelete_.store(false, std::memory_order_relaxed);
     pendingDeleteHash_ = "";
     const bool ok = dataStore_->deleteBook(hash);
     Serial.printf("[ble-delete] hash=%s ok=%d\n", hash.c_str(), ok);
   }
 
-  if (pendingPosition_) {
+  if (pendingPosition_.load(std::memory_order_acquire)) {
     const String hash = pendingPositionHash_;
     const uint32_t wordIndex = pendingPositionWord_;
-    pendingPosition_ = false;
+    pendingPosition_.store(false, std::memory_order_relaxed);
     pendingPositionHash_ = "";
     pendingPositionWord_ = 0;
     const bool ok = dataStore_->writePosition(hash, wordIndex);
@@ -342,14 +372,26 @@ void BleSyncManager::update() {
     }
   }
 
-  if (pendingActive_) {
+  if (pendingActive_.load(std::memory_order_acquire)) {
     const String hash = pendingActiveHash_;
-    pendingActive_ = false;
+    pendingActive_.store(false, std::memory_order_relaxed);
     pendingActiveHash_ = "";
     Serial.printf("[ble-active] open hash=%s\n", hash.c_str());
     if (activeListener_) {
       activeListener_(hash);
     }
+  }
+
+  // Kick-off on trigger tick (HDR), then one notify per subsequent tick.
+  // `else if` enforces a one-frame-per-tick cadence; back-to-back notifies
+  // cause clients to drop the leading packet ("END before HDR" symptom).
+  if (pendingLibraryFetch_.load(std::memory_order_acquire)) {
+    pendingLibraryFetch_.store(false, std::memory_order_relaxed);
+    const uint16_t handle =
+        pendingLibraryConnHandle_.load(std::memory_order_relaxed);
+    startLibraryStream(handle);
+  } else if (libStream_.active) {
+    advanceLibraryStream();
   }
 
   // Drain any SD work captured by the NimBLE write callback.
@@ -428,13 +470,71 @@ void BleSyncManager::update() {
 }
 
 void BleSyncManager::end() {
-  if (!active_) {
+  if (!active_.load(std::memory_order_acquire) &&
+      shutdownPhase_ == ShutdownPhase::Idle) {
     return;
   }
+  if (shutdownPhase_ != ShutdownPhase::Idle) {
+    return;
+  }
+
+  // Flip active_ release-store FIRST so the disconnect callback skips its
+  // re-advertise path while the deinit is in flight.
+  active_.store(false, std::memory_order_release);
+
   resetUpload();
+  pendingLibraryFetch_.store(false, std::memory_order_relaxed);
+  pendingPosition_.store(false, std::memory_order_relaxed);
+  pendingActive_.store(false, std::memory_order_relaxed);
+  pendingDelete_.store(false, std::memory_order_relaxed);
+  libStream_ = LibraryStream{};
+
+  // Schedule across ticks: vTaskDelay here would freeze the reader and
+  // deadlock if end() ran from a NimBLE/HTTP callback context.
+  if (server_ != nullptr) {
+    const auto peers = server_->getPeerDevices();
+    for (const uint16_t handle : peers) {
+      server_->disconnect(handle);
+    }
+  }
   NimBLEDevice::stopAdvertising();
-  NimBLEDevice::deinit(true);
-  active_ = false;
+  shutdownPhase_ = ShutdownPhase::DisconnectIssued;
+  shutdownPhaseStartedMs_ = millis();
+  Serial.println("[ble] end() scheduled; draining...");
+}
+
+void BleSyncManager::tickShutdown() {
+  const uint32_t now = millis();
+  switch (shutdownPhase_) {
+    case ShutdownPhase::Idle:
+      return;
+    case ShutdownPhase::DisconnectIssued:
+      shutdownPhase_ = ShutdownPhase::AwaitingDrain;
+      shutdownPhaseStartedMs_ = now;
+      return;
+    case ShutdownPhase::AwaitingDrain:
+      // Guard band so in-flight notifies + disconnect events flush before
+      // deinit. NimBLE deinit on a live connection crashes the chip.
+      if (now - shutdownPhaseStartedMs_ < 200) {
+        return;
+      }
+      shutdownPhase_ = ShutdownPhase::Deinit;
+      return;
+    case ShutdownPhase::Deinit:
+      NimBLEDevice::deinit(true);
+      server_ = nullptr;
+      infoChar_ = nullptr;
+      libraryChar_ = nullptr;
+      activeChar_ = nullptr;
+      positionChar_ = nullptr;
+      transferChar_ = nullptr;
+      settingsChar_ = nullptr;
+      storageChar_ = nullptr;
+      deleteChar_ = nullptr;
+      shutdownPhase_ = ShutdownPhase::Idle;
+      Serial.println("[ble] end() complete");
+      return;
+  }
 }
 
 String BleSyncManager::buildInfoJson() {
@@ -510,10 +610,10 @@ bool BleSyncManager::applyActiveHash(const String &hash, String &error) {
   // the next BLE write. Caller is trusted to provide a valid hash; on next
   // reader-open the device will surface "book not found" if it isn't.
   dataStore_->setActiveBookHash(hash);
-  // Defer the open-book call to the Arduino loop task. Opening a book runs
-  // an SD index build on first read, which would block the BLE host.
+  // Defer to loop task; opening a book runs an SD index build that would
+  // block the BLE host. Release-store publishes the hash to the reader.
   pendingActiveHash_ = hash;
-  pendingActive_ = true;
+  pendingActive_.store(true, std::memory_order_release);
   return true;
 }
 
@@ -532,13 +632,12 @@ bool BleSyncManager::applyPositionJson(const String &body, String &error) {
     error = "Missing wordIndex";
     return false;
   }
-  // Capture the write request; the actual NVS write + listener fire on the
-  // Arduino loop task via update(). Keeping it off the NimBLE host task
-  // avoids stalls when the listener does work (e.g. seeking the live reader).
-  const bool coalesced = pendingPosition_;
+  // Capture; loop task does the NVS write + listener via update() so the
+  // BLE host task isn't stalled by reader-seek work.
+  const bool coalesced = pendingPosition_.load(std::memory_order_relaxed);
   pendingPositionHash_ = hash;
   pendingPositionWord_ = wordIndex;
-  pendingPosition_ = true;
+  pendingPosition_.store(true, std::memory_order_release);
   Serial.printf("[ble-pos] queued hash=%s word=%u coalesced=%d\n", hash.c_str(),
                 static_cast<unsigned>(wordIndex), coalesced);
   return true;
@@ -598,7 +697,7 @@ void BleSyncManager::onDeleteWrite(const uint8_t *bytes, size_t len) {
     return;
   }
   pendingDeleteHash_ = hash;
-  pendingDelete_ = true;
+  pendingDelete_.store(true, std::memory_order_release);
 }
 
 void BleSyncManager::resetUpload() {
@@ -617,4 +716,170 @@ void BleSyncManager::notifyTransfer(const char *msg) {
   Serial.println("[ble-xfer] setValue done");
   transferChar_->notify();
   Serial.println("[ble-xfer] notify done");
+}
+
+void BleSyncManager::notifyPosition(const String &hash, uint32_t wordIndex) {
+  if (!active_.load(std::memory_order_acquire) || positionChar_ == nullptr) {
+    return;
+  }
+  // Rate-limit to ~5 Hz. Reader saves can run faster at high WPM; library +
+  // transfer notifies share the same NimBLE mbuf pool so we shouldn't flood.
+  const uint32_t now = millis();
+  if (lastPositionNotifyMs_ != 0 && now - lastPositionNotifyMs_ < 200) {
+    return;
+  }
+  String body = "{\"hash\":\"";
+  body += hash;
+  body += "\",\"wordIndex\":";
+  body += String(wordIndex);
+  body += "}";
+  positionChar_->setValue(reinterpret_cast<const uint8_t *>(body.c_str()),
+                          body.length());
+  if (!positionChar_->notify()) {
+    // No subscriber or mbuf exhausted; harmless. App falls back to the
+    // connect-time read on next session.
+    return;
+  }
+  lastPositionNotifyMs_ = now;
+}
+
+void BleSyncManager::startLibraryStream(uint16_t connHandle) {
+  if (libraryChar_ == nullptr || server_ == nullptr) {
+    return;
+  }
+  if (libStream_.active) {
+    // Drop overlapping trigger; in-flight stream still carries the same
+    // data, next refresh picks up any changes.
+    Serial.println("[ble-lib] trigger while busy; ignored");
+    return;
+  }
+
+  libStream_.payload = buildLibraryJson();
+  libStream_.len = static_cast<uint32_t>(libStream_.payload.length());
+
+  // NimBLE notify payload max = peerMTU - 3 (ATT opcode + handle). DATA frame
+  // adds 3 bytes (tag + u16 seq). Cap at 240 for clients that negotiate a
+  // smaller MTU.
+  uint16_t peerMtu = server_->getPeerMTU(connHandle);
+  if (peerMtu < 23) {
+    peerMtu = 23;
+  }
+  uint32_t chunkSize = static_cast<uint32_t>(peerMtu) - 6;
+  if (chunkSize > 240) {
+    chunkSize = 240;
+  }
+  if (chunkSize < 16) {
+    chunkSize = 16;
+  }
+  libStream_.chunkSize = chunkSize;
+  libStream_.totalChunks =
+      libStream_.len == 0 ? 0 : (libStream_.len + chunkSize - 1) / chunkSize;
+
+  if (libStream_.totalChunks > 0xFFFF) {
+    // ERR frame. Per-call buffer sized to fit any future reason without
+    // touching the stack frame size constant.
+    const char reason[] = "payload too large";
+    constexpr size_t kReasonLen = sizeof(reason) - 1;
+    uint8_t err[1 + kReasonLen];
+    err[0] = 0x7F;
+    memcpy(err + 1, reason, kReasonLen);
+    libraryChar_->setValue(err, sizeof(err));
+    libraryChar_->notify();
+    Serial.printf("[ble-lib] ERR: %s (payload=%u)\n", reason,
+                  static_cast<unsigned>(libStream_.len));
+    libStream_.payload = "";
+    return;
+  }
+
+  libStream_.crc = esp_crc32_le(
+      0, reinterpret_cast<const uint8_t *>(libStream_.payload.c_str()),
+      libStream_.len);
+
+  Serial.printf(
+      "[ble-lib] stream start payload=%u chunkSize=%u totalChunks=%u mtu=%u crc=%08x\n",
+      static_cast<unsigned>(libStream_.len),
+      static_cast<unsigned>(libStream_.chunkSize),
+      static_cast<unsigned>(libStream_.totalChunks),
+      static_cast<unsigned>(peerMtu), static_cast<unsigned>(libStream_.crc));
+
+  // HDR frame: [0x01][totalChunks:u16 BE][totalBytes:u32 BE]
+  uint8_t hdr[1 + 2 + 4];
+  hdr[0] = 0x01;
+  hdr[1] = static_cast<uint8_t>((libStream_.totalChunks >> 8) & 0xFF);
+  hdr[2] = static_cast<uint8_t>(libStream_.totalChunks & 0xFF);
+  hdr[3] = static_cast<uint8_t>((libStream_.len >> 24) & 0xFF);
+  hdr[4] = static_cast<uint8_t>((libStream_.len >> 16) & 0xFF);
+  hdr[5] = static_cast<uint8_t>((libStream_.len >> 8) & 0xFF);
+  hdr[6] = static_cast<uint8_t>(libStream_.len & 0xFF);
+  libraryChar_->setValue(hdr, sizeof(hdr));
+  libraryChar_->notify();
+
+  libStream_.nextSeq = 0;
+  // First DATA waits the inter-emit gap so the client has time to process
+  // subscribe + HDR before the next packet.
+  libStream_.lastEmitMs = millis();
+  libStream_.active = true;
+}
+
+void BleSyncManager::advanceLibraryStream() {
+  if (!libStream_.active || libraryChar_ == nullptr) {
+    return;
+  }
+
+  // Rate-limit: Android BLE stacks silently drop DATA notifies arriving
+  // faster than the client can drain. 30 ms gap (~33 pkt/s) is safe under
+  // the platform's notification throughput ceiling.
+  const uint32_t now = millis();
+  if (libStream_.lastEmitMs != 0 && now - libStream_.lastEmitMs < 30) {
+    return;
+  }
+
+  if (libStream_.nextSeq < libStream_.totalChunks) {
+    const uint32_t offset = libStream_.nextSeq * libStream_.chunkSize;
+    const uint32_t remaining = libStream_.len - offset;
+    const uint32_t take =
+        remaining < libStream_.chunkSize ? remaining : libStream_.chunkSize;
+    uint8_t frame[1 + 2 + 240];
+    frame[0] = 0x02;
+    frame[1] = static_cast<uint8_t>((libStream_.nextSeq >> 8) & 0xFF);
+    frame[2] = static_cast<uint8_t>(libStream_.nextSeq & 0xFF);
+    memcpy(frame + 3,
+           reinterpret_cast<const uint8_t *>(libStream_.payload.c_str()) + offset,
+           take);
+    libraryChar_->setValue(frame, 3 + take);
+    // notify() returns false on no subscriber or mbuf exhaustion. On
+    // failure, leave seq alone and retry next tick.
+    const bool ok = libraryChar_->notify();
+    if (!ok) {
+      Serial.printf("[ble-lib] notify failed seq=%u, retry next tick\n",
+                    static_cast<unsigned>(libStream_.nextSeq));
+      return;
+    }
+    libStream_.lastEmitMs = now;
+    libStream_.nextSeq++;
+    return;
+  }
+
+  // END frame. Empty-library case (totalChunks==0) needs the inter-emit
+  // gap too; the top-of-function rate-limit already enforces it.
+  uint8_t end[1 + 4];
+  end[0] = 0x03;
+  end[1] = static_cast<uint8_t>((libStream_.crc >> 24) & 0xFF);
+  end[2] = static_cast<uint8_t>((libStream_.crc >> 16) & 0xFF);
+  end[3] = static_cast<uint8_t>((libStream_.crc >> 8) & 0xFF);
+  end[4] = static_cast<uint8_t>(libStream_.crc & 0xFF);
+  libraryChar_->setValue(end, sizeof(end));
+  const bool endOk = libraryChar_->notify();
+  if (!endOk) {
+    Serial.println("[ble-lib] END notify failed, retry next tick");
+    return;
+  }
+
+  Serial.printf("[ble-lib] stream done chunks=%u bytes=%u\n",
+                static_cast<unsigned>(libStream_.totalChunks),
+                static_cast<unsigned>(libStream_.len));
+
+  libStream_.active = false;
+  libStream_.payload = "";  // free String backing storage
+  libStream_.lastEmitMs = 0;
 }
