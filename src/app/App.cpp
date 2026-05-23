@@ -180,6 +180,12 @@ constexpr size_t kWifiSettingsChooseIndex = 2;
 constexpr size_t kWifiSettingsAutoUpdateIndex = 3;
 constexpr size_t kWifiSettingsForgetIndex = 4;
 constexpr size_t kWifiSettingsOtaOwnerIndex = 5;
+#ifdef RSVP_BLE_SYNC
+constexpr size_t kWifiSettingsBleToggleIndex = 6;
+constexpr size_t kWifiSettingsItemCount = 7;
+static_assert(kWifiSettingsItemCount == kWifiSettingsBleToggleIndex + 1,
+              "kWifiSettingsItemCount must equal the highest WifiSettings index + 1");
+#endif
 
 constexpr size_t kBookPickerBackIndex = 0;
 constexpr size_t kChapterPickerBackIndex = 0;
@@ -746,6 +752,24 @@ void App::begin() {
 
   display_.renderProgress("SD", "Loading books", "Use SD converter for EPUB", 0);
   storageReady_ = storage_.begin();
+  Serial.printf("[boot] storage ready=%d\n", storageReady_);
+#ifdef RSVP_BLE_SYNC
+  const bool dataStoreOk = dataStore_.begin();
+  Serial.printf("[boot] data store ready=%d\n", dataStoreOk);
+  bleSync_.setPositionListener(
+      [this](const String &hash, uint32_t wordIndex) { onBlePositionUpdate(hash, wordIndex); });
+  bleSync_.setActiveListener([this](const String &hash) { onBleActiveBookChange(hash); });
+  if (!dataStoreOk) {
+    Serial.println("[boot] ble skipped (dataStore not ready)");
+  } else if (dataStore_.bleEnabled()) {
+    bleEnabledLastSeen_ = true;
+    const bool bleOk = bleSync_.begin(dataStore_);
+    Serial.printf("[boot] ble ready=%d\n", bleOk);
+  } else {
+    bleEnabledLastSeen_ = false;
+    Serial.println("[boot] ble disabled");
+  }
+#endif
   const uint16_t savedWpm = preferences_.getUShort(kPrefWpm, reader_.wpm());
   reader_.setWpm(savedWpm);
 
@@ -778,6 +802,10 @@ void App::begin() {
 void App::update(uint32_t nowMs) {
   button_.update(nowMs);
   powerButton_.update(nowMs);
+#ifdef RSVP_BLE_SYNC
+  bleSync_.update();
+  reconcileBleEnabled();
+#endif
   const bool standbyComboConsumed = handleStandbyCombo(nowMs);
   if (!standbyComboConsumed) {
     handleBootButton(nowMs);
@@ -2877,10 +2905,47 @@ void App::selectWifiSettingsItem(uint32_t nowMs) {
                     preferences_.getString(kPrefOtaOwner, ""), "", false, 39,
                     MenuScreen::WifiSettings);
       return;
+#ifdef RSVP_BLE_SYNC
+    case kWifiSettingsBleToggleIndex:
+      dataStore_.setBleEnabled(!dataStore_.bleEnabled());
+      reconcileBleEnabled();
+      rebuildSettingsMenuItems();
+      renderSettings();
+      return;
+#endif
     default:
       return;
   }
 }
+
+#ifdef RSVP_BLE_SYNC
+void App::reconcileBleEnabled() {
+  const bool desired = dataStore_.bleEnabled();
+  // bleEnabledLastSeen_ cached so a failed begin() doesn't spin: act once
+  // per pref change, leave alone until the pref flips again.
+  if (desired == bleEnabledLastSeen_) {
+    return;
+  }
+  bleEnabledLastSeen_ = desired;
+
+  if (desired) {
+    if (!bleSync_.active()) {
+      const bool ok = bleSync_.begin(dataStore_);
+      Serial.printf("[settings] ble begin ok=%d\n", ok);
+      if (!ok) {
+        dataStore_.setBleEnabled(false);
+        bleEnabledLastSeen_ = false;
+        Serial.println("[settings] ble begin failed; pref rolled back");
+      }
+    }
+  } else {
+    if (bleSync_.active()) {
+      bleSync_.end();
+      Serial.println("[settings] ble end scheduled");
+    }
+  }
+}
+#endif
 
 void App::scanWifiNetworks() {
   if (blockNetworkActionForOtaCheck("Wi-Fi", millis())) {
@@ -3394,6 +3459,14 @@ void App::rebuildSettingsMenuItems() {
     settingsMenuItems_.push_back("Auto OTA: " + String(otaAutoCheckEnabled() ? "On" : "Off"));
     settingsMenuItems_.push_back("Forget network");
     settingsMenuItems_.push_back("OTA Owner: " + otaOwnerLabel());
+#ifdef RSVP_BLE_SYNC
+    settingsMenuItems_.push_back("BLE sync: " + String(dataStore_.bleEnabled() ? "On" : "Off"));
+    if (settingsMenuItems_.size() != kWifiSettingsItemCount) {
+      Serial.printf("[settings] BUG: WifiSettings push count %u != expected %u\n",
+                    static_cast<unsigned>(settingsMenuItems_.size()),
+                    static_cast<unsigned>(kWifiSettingsItemCount));
+    }
+#endif
   }
 
   if (settingsSelectedIndex_ >= settingsMenuItems_.size()) {
@@ -4860,12 +4933,26 @@ void App::loadPendingBootBook(uint32_t nowMs) {
   renderActiveReader(millis());
 }
 
+// Invariant: currentBookPath_ always names the book bound to reader_ at the
+// time of save. Any caller that swaps currentBookPath_ must reset the reader
+// through loadBookAtIndex before invoking this, otherwise the (path, index)
+// pair we persist (and notify peers about) describes the wrong book.
 void App::saveReadingPosition(bool force) {
   if (!usingStorageBook_ || currentBookPath_.isEmpty()) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.printf("[save] SKIP usingStorage=%d pathEmpty=%d force=%d\n",
+                  usingStorageBook_, currentBookPath_.isEmpty(), force);
+#endif
     return;
   }
 
   const size_t wordIndex = reader_.currentIndex();
+#if CORE_DEBUG_LEVEL >= 3
+  Serial.printf("[save] entry force=%d word=%u last=%u path=%s\n",
+                force, static_cast<unsigned>(wordIndex),
+                static_cast<unsigned>(lastSavedWordIndex_),
+                currentBookPath_.c_str());
+#endif
   if (!force && wordIndex == lastSavedWordIndex_) {
     return;
   }
@@ -4880,6 +4967,13 @@ void App::saveReadingPosition(bool force) {
   lastSavedWordIndex_ = wordIndex;
   Serial.printf("[app] saved position word=%u book=%s\n", static_cast<unsigned int>(wordIndex),
                 currentBookPath_.c_str());
+
+#ifdef RSVP_BLE_SYNC
+  if (bleSync_.active() && !currentBookPath_.isEmpty()) {
+    bleSync_.notifyPosition(BleDataStore::hashBookPath(currentBookPath_),
+                            static_cast<uint32_t>(wordIndex));
+  }
+#endif
 }
 
 bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPositionFallback,
@@ -4925,6 +5019,13 @@ bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPosition
 
   const uint32_t savedWordIndex =
       savedWordIndexForBook(currentBookPath_, allowLegacyPositionFallback);
+#if CORE_DEBUG_LEVEL >= 3
+  Serial.printf("[load] book=%s key=%s saved=%u nosaved=%d\n",
+                currentBookPath_.c_str(),
+                bookPositionKey(currentBookPath_).c_str(),
+                static_cast<unsigned>(savedWordIndex),
+                savedWordIndex == kNoSavedWordIndex);
+#endif
   if (savedWordIndex != kNoSavedWordIndex) {
     renderStorageStatus("Opening book", currentBookTitle_.c_str(), "Restoring position", 78);
     reader_.seekTo(savedWordIndex);
@@ -4950,6 +5051,105 @@ bool App::loadBookAtIndex(size_t index, uint32_t nowMs, bool allowLegacyPosition
                 static_cast<unsigned int>(paragraphStarts_.size()));
   return true;
 }
+
+#ifdef RSVP_BLE_SYNC
+void App::onBlePositionUpdate(const String &hash, uint32_t wordIndex) {
+  if (!usingStorageBook_ || currentBookPath_.isEmpty()) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.printf("[ble-update] SKIP hash=%s word=%u usingStorage=%d pathEmpty=%d\n",
+                  hash.c_str(), static_cast<unsigned>(wordIndex),
+                  usingStorageBook_, currentBookPath_.isEmpty());
+#endif
+    return;
+  }
+  const String currentHash = BleDataStore::hashBookPath(currentBookPath_);
+  if (currentHash != hash) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.printf("[ble-update] SKIP hash mismatch incoming=%s current=%s\n",
+                  hash.c_str(), currentHash.c_str());
+#endif
+    return;
+  }
+  const size_t wc = reader_.wordCount();
+  const size_t prevIdx = reader_.currentIndex();
+  const size_t target = std::min(static_cast<size_t>(wordIndex), wc == 0 ? 0u : wc - 1);
+#if CORE_DEBUG_LEVEL >= 3
+  Serial.printf("[ble-update] PRE wc=%u prevIdx=%u target=%u last=%u state=%d\n",
+                static_cast<unsigned>(wc), static_cast<unsigned>(prevIdx),
+                static_cast<unsigned>(target),
+                static_cast<unsigned>(lastSavedWordIndex_),
+                static_cast<int>(state_));
+#endif
+  if (target == reader_.currentIndex()) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.println("[ble-update] noop (same position)");
+#endif
+    return;
+  }
+  reader_.seekTo(target);
+  // Mark this position as already saved so the next saveReadingPosition pass
+  // doesn't write a stale reader_.currentIndex() over the just-pushed value.
+  lastSavedWordIndex_ = target;
+  // Force a redraw. In Paused/Menu the main loop does not auto-render, so the
+  // device would otherwise stay frozen on the old word until the user touches
+  // the screen.
+  if (state_ == AppState::Playing || state_ == AppState::Paused) {
+    renderActiveReader(millis());
+  }
+#if CORE_DEBUG_LEVEL >= 3
+  Serial.printf("[ble-update] POST idx=%u last=%u rendered=%d\n",
+                static_cast<unsigned>(reader_.currentIndex()),
+                static_cast<unsigned>(lastSavedWordIndex_),
+                (state_ == AppState::Playing || state_ == AppState::Paused) ? 1 : 0);
+#endif
+}
+
+void App::onBleActiveBookChange(const String &hash) {
+  if (hash.isEmpty()) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.println("[ble-active] empty hash, ignoring");
+#endif
+    return;
+  }
+  const String path = dataStore_.resolvePathByHash(hash);
+  if (path.isEmpty()) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.printf("[ble-active] hash=%s not found on SD\n", hash.c_str());
+#endif
+    return;
+  }
+  int index = findBookIndexByPath(path);
+  if (index < 0) {
+    // Fresh upload: SD has the file but the in-memory inventory was scanned
+    // before it landed. Rescan and retry once.
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.printf("[ble-active] path %s not in storage_ index, refreshing\n", path.c_str());
+#endif
+    storage_.refreshBooks();
+    index = findBookIndexByPath(path);
+    if (index < 0) {
+#if CORE_DEBUG_LEVEL >= 3
+      Serial.printf("[ble-active] still not found after refresh\n");
+#endif
+      return;
+    }
+  }
+  // Persist current book's position before swapping.
+  saveReadingPosition(true);
+  const uint32_t nowMs = millis();
+  if (!loadBookAtIndex(static_cast<size_t>(index), nowMs)) {
+#if CORE_DEBUG_LEVEL >= 3
+    Serial.printf("[ble-active] loadBookAtIndex failed for %s\n", path.c_str());
+#endif
+    return;
+  }
+  setState(AppState::Paused, nowMs);
+  renderActiveReader(nowMs);
+#if CORE_DEBUG_LEVEL >= 3
+  Serial.printf("[ble-active] opened book at index=%d path=%s\n", index, path.c_str());
+#endif
+}
+#endif  // RSVP_BLE_SYNC
 
 String App::bookPositionKey(const String &bookPath) const {
   char key[10];

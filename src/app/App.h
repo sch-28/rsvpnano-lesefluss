@@ -17,6 +17,10 @@
 #include "rss/RssFeedManager.h"
 #include "storage/StorageManager.h"
 #include "sync/CompanionSyncManager.h"
+#ifdef RSVP_BLE_SYNC
+#include "ble/BleDataStore.h"
+#include "ble/BleSyncManager.h"
+#endif
 #include "timer/FocusTimer.h"
 #include "update/OtaUpdater.h"
 #include "usb/UsbMassStorageManager.h"
@@ -37,6 +41,18 @@ class App {
 
   void begin();
   void update(uint32_t nowMs);
+
+#ifdef RSVP_BLE_SYNC
+  // Called by BleSyncManager (via setPositionListener) on the Arduino loop
+  // task when the app pushes a position write naming the currently-open
+  // book. Seeks the live reader to wordIndex and resets the saved-position
+  // tracker so the next save doesn't overwrite with a stale value.
+  void onBlePositionUpdate(const String &hash, uint32_t wordIndex);
+
+  // Called when the app writes a new hash to the multibook `active`
+  // characteristic. Opens the matching book on the device's reader.
+  void onBleActiveBookChange(const String &hash);
+#endif
 
  private:
   static constexpr size_t kOtaVersionLabelMax = 32;
@@ -237,6 +253,10 @@ class App {
   void cycleTypographyPreviewSample(int direction);
   void rebuildSettingsMenuItems();
   void applyPacingSettings();
+#ifdef RSVP_BLE_SYNC
+  void reconcileBleEnabled();
+  bool bleEnabledLastSeen_ = false;
+#endif
   void maybeAutoCheckForUpdates(uint32_t nowMs);
   bool startBackgroundOtaCheck(const OtaUpdater::Config &config);
   static void otaCheckTask(void *params);
@@ -416,6 +436,10 @@ class App {
   OtaUpdater otaUpdater_;
   RssFeedManager rssFeedManager_;
   CompanionSyncManager companionSync_;
+#ifdef RSVP_BLE_SYNC
+  BleDataStore dataStore_;
+  BleSyncManager bleSync_;
+#endif
   UsbMassStorageManager usbTransfer_;
   Preferences preferences_;
   PausedTouchSession pausedTouch_;
