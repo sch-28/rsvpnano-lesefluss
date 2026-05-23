@@ -1761,6 +1761,22 @@ struct IndexedBuildContext {
   uint32_t dataSize = 0;
   bool failed = false;
   const char *failure = "";
+
+  // v2 (.rsvp 2) state. Set when the parser sees `@rsvp 2`; transitions
+  // through HEADER → WORDS → PARAGRAPHS → CHAPTERS → DONE driven by the
+  // count-prefixed block directives (`@words N`, `@paragraphs M`,
+  // `@chapters K`). When active, the legacy tokenizer is bypassed and word
+  // lines are written verbatim into WordRecord[].
+  enum V2State : uint8_t {
+    V2_HEADER = 0,
+    V2_WORDS = 1,
+    V2_PARAGRAPHS = 2,
+    V2_CHAPTERS = 3,
+    V2_DONE = 4,
+  };
+  bool v2Mode = false;
+  V2State v2State = V2_HEADER;
+  uint32_t v2Remaining = 0;
 };
 
 void addIndexedChapterMarker(IndexedBuildContext &context, const String &title) {
@@ -1874,8 +1890,220 @@ bool processIndexedBookLine(const String &line, IndexedBuildContext &context,
   return appendIndexedLineWords(line, context, stats);
 }
 
+// Emit a single WordRecord whose text is taken verbatim from the input. Used
+// by the v2 (`@rsvp 2`) parser where the app has already tokenized the book
+// and shipped the canonical word list. Skips trim / BOM strip / readable
+// filter because v2 words are produced by the canonical TS tokenizer.
+bool emitV2WordRecord(const String &word, IndexedBuildContext &context, ParseStats *stats) {
+  if (word.length() > UINT16_MAX ||
+      context.dataSize > UINT32_MAX - static_cast<uint32_t>(word.length())) {
+    context.failed = true;
+    context.failure = "Index limit reached";
+    return false;
+  }
+  if ((context.wordCount % kParseMemoryCheckWordInterval) == 0 && context.wordCount > 0 &&
+      parseMemoryLow()) {
+    if (stats != nullptr) {
+      stats->memoryLow = true;
+    }
+    context.failed = true;
+    context.failure = "Memory limit reached";
+    return false;
+  }
+
+  IndexedBookStore::WordRecord record;
+  record.offset = context.dataSize;
+  record.length = static_cast<uint16_t>(word.length());
+  record.flags = 0;
+
+  if (!writeExact(*context.dataFile, word.c_str(), word.length()) ||
+      !writeExact(*context.indexFile, &record, sizeof(record))) {
+    context.failed = true;
+    context.failure = "SD write failed";
+    return false;
+  }
+
+  context.dataSize += static_cast<uint32_t>(word.length());
+  ++context.wordCount;
+  if (context.metadata != nullptr) {
+    context.metadata->wordCount = context.wordCount;
+  }
+  return true;
+}
+
+bool processIndexedRsvpV2Line(const String &line, IndexedBuildContext &context,
+                              ParseStats *stats) {
+  switch (context.v2State) {
+    case IndexedBuildContext::V2_HEADER: {
+      String trimmed = stripBom(line);
+      if (trimmed.isEmpty()) {
+        return true;
+      }
+      if (trimmed.startsWith("@")) {
+        String lowered = trimmed;
+        lowered.toLowerCase();
+        if (context.metadata != nullptr && prefixHasBoundary(lowered, "@title")) {
+          context.metadata->title = directiveValue(trimmed, "@title");
+          return true;
+        }
+        if (context.metadata != nullptr && prefixHasBoundary(lowered, "@author")) {
+          context.metadata->author = directiveValue(trimmed, "@author");
+          return true;
+        }
+        if (prefixHasBoundary(lowered, "@source")) {
+          return true;
+        }
+        if (prefixHasBoundary(lowered, "@words")) {
+          const long parsed = directiveValue(trimmed, "@words").toInt();
+          Serial.printf("[storage-index] v2 @words declared=%ld\n", parsed);
+          if (parsed <= 0) {
+            context.v2State = IndexedBuildContext::V2_PARAGRAPHS;
+            return true;
+          }
+          uint32_t clamped = static_cast<uint32_t>(parsed);
+          if (hasBookWordLimit() && static_cast<size_t>(parsed) > kMaxBookWords) {
+            clamped = static_cast<uint32_t>(kMaxBookWords);
+            Serial.printf("[storage-index] v2 @words clamped %ld -> %u\n", parsed,
+                          static_cast<unsigned>(clamped));
+          }
+          context.v2Remaining = clamped;
+          context.v2State = IndexedBuildContext::V2_WORDS;
+          return true;
+        }
+        if (prefixHasBoundary(lowered, "@rsvp")) {
+          return true;
+        }
+      }
+      // Stray non-directive line during header: skip.
+      return true;
+    }
+    case IndexedBuildContext::V2_WORDS: {
+      if (context.v2Remaining == 0) {
+        context.v2State = IndexedBuildContext::V2_PARAGRAPHS;
+        return processIndexedRsvpV2Line(line, context, stats);
+      }
+      if (!emitV2WordRecord(line, context, stats)) {
+        return false;
+      }
+      // Periodic checkpoint so we can correlate emit count with source byte
+      // progress in case the read loop stalls before V2_WORDS transitions.
+      if ((context.wordCount % 50000) == 0) {
+        Serial.printf("[storage-index] v2 WORDS progress wordCount=%u remaining=%u\n",
+                      static_cast<unsigned>(context.wordCount),
+                      static_cast<unsigned>(context.v2Remaining));
+      }
+      if (--context.v2Remaining == 0) {
+        Serial.printf("[storage-index] v2 WORDS done wordCount=%u\n",
+                      static_cast<unsigned>(context.wordCount));
+        context.v2State = IndexedBuildContext::V2_PARAGRAPHS;
+      }
+      return true;
+    }
+    case IndexedBuildContext::V2_PARAGRAPHS: {
+      String trimmed = stripBom(line);
+      if (trimmed.isEmpty()) {
+        return true;
+      }
+      if (context.v2Remaining == 0) {
+        // Expecting `@paragraphs N` directive.
+        if (trimmed.startsWith("@")) {
+          String lowered = trimmed;
+          lowered.toLowerCase();
+          if (prefixHasBoundary(lowered, "@paragraphs")) {
+            context.v2Remaining =
+                static_cast<uint32_t>(directiveValue(trimmed, "@paragraphs").toInt());
+            Serial.printf("[storage-index] v2 @paragraphs N=%u\n",
+                          static_cast<unsigned>(context.v2Remaining));
+            if (context.v2Remaining == 0) {
+              context.v2State = IndexedBuildContext::V2_CHAPTERS;
+            }
+            return true;
+          }
+        }
+        Serial.printf("[storage-index] v2 stray line in PARAGRAPHS(awaiting @paragraphs): %.40s\n",
+                      trimmed.c_str());
+        return true;
+      }
+      // Body line = "<wordIndex>".
+      if (context.metadata != nullptr) {
+        const uint32_t wordIndex = static_cast<uint32_t>(trimmed.toInt());
+        if (context.metadata->paragraphStarts.empty() ||
+            context.metadata->paragraphStarts.back() != wordIndex) {
+          context.metadata->paragraphStarts.push_back(wordIndex);
+        }
+      }
+      if (--context.v2Remaining == 0) {
+        context.v2State = IndexedBuildContext::V2_CHAPTERS;
+      }
+      return true;
+    }
+    case IndexedBuildContext::V2_CHAPTERS: {
+      String trimmed = stripBom(line);
+      if (trimmed.isEmpty()) {
+        return true;
+      }
+      if (context.v2Remaining == 0) {
+        if (trimmed.startsWith("@")) {
+          String lowered = trimmed;
+          lowered.toLowerCase();
+          if (prefixHasBoundary(lowered, "@chapters")) {
+            context.v2Remaining =
+                static_cast<uint32_t>(directiveValue(trimmed, "@chapters").toInt());
+            Serial.printf("[storage-index] v2 @chapters K=%u\n",
+                          static_cast<unsigned>(context.v2Remaining));
+            if (context.v2Remaining == 0) {
+              context.v2State = IndexedBuildContext::V2_DONE;
+            }
+            return true;
+          }
+        }
+        Serial.printf("[storage-index] v2 stray line in CHAPTERS(awaiting @chapters): %.40s\n",
+                      trimmed.c_str());
+        return true;
+      }
+      // Body line = "<wordIndex>\t<title>".
+      const int tab = trimmed.indexOf('\t');
+      uint32_t wordIndex = 0;
+      String title;
+      if (tab > 0) {
+        wordIndex = static_cast<uint32_t>(trimmed.substring(0, tab).toInt());
+        title = trimmed.substring(tab + 1);
+        title.trim();
+      } else {
+        wordIndex = static_cast<uint32_t>(trimmed.toInt());
+        title = "";
+      }
+      if (context.metadata != nullptr && !title.isEmpty()) {
+        ChapterMarker marker;
+        marker.title = title;
+        marker.wordIndex = wordIndex;
+        if (!context.metadata->chapters.empty() &&
+            context.metadata->chapters.back().wordIndex == marker.wordIndex) {
+          context.metadata->chapters.back() = marker;
+        } else {
+          context.metadata->chapters.push_back(marker);
+        }
+      }
+      if (--context.v2Remaining == 0) {
+        context.v2State = IndexedBuildContext::V2_DONE;
+      }
+      return true;
+    }
+    case IndexedBuildContext::V2_DONE:
+      // Ignore trailing content.
+      return true;
+  }
+  return true;
+}
+
 bool processIndexedRsvpLine(const String &line, IndexedBuildContext &context,
                             bool &paragraphPending, ParseStats *stats) {
+  // v2 fast-path: once we've entered v2 mode, all subsequent lines flow
+  // through the count-bounded state machine and skip the legacy tokenizer.
+  if (context.v2Mode) {
+    return processIndexedRsvpV2Line(line, context, stats);
+  }
+
   String trimmed = stripBom(line);
   if (trimmed.isEmpty()) {
     paragraphPending = true;
@@ -1894,6 +2122,17 @@ bool processIndexedRsvpLine(const String &line, IndexedBuildContext &context,
   if (trimmed.startsWith("@")) {
     String lowered = trimmed;
     lowered.toLowerCase();
+    // Detect v2 header. Subsequent lines route through the v2 parser.
+    if (prefixHasBoundary(lowered, "@rsvp")) {
+      const String value = directiveValue(trimmed, "@rsvp");
+      const long version = value.toInt();
+      Serial.printf("[storage-index] @rsvp directive version=%ld\n", version);
+      if (version >= 2) {
+        context.v2Mode = true;
+        context.v2State = IndexedBuildContext::V2_HEADER;
+      }
+      return true;
+    }
     if (prefixHasBoundary(lowered, "@para")) {
       paragraphPending = true;
       return true;
@@ -2498,6 +2737,13 @@ bool StorageManager::buildIndexedBook(const String &path, BookMetadata &metadata
       parseFailed = true;
     }
   }
+
+  Serial.printf(
+      "[storage-index] read loop done totalBytes=%u sourceBytes=%u v2State=%d v2Remaining=%u "
+      "keepReading=%d parseFailed=%d lineBufLen=%u\n",
+      static_cast<unsigned>(totalBytesRead), static_cast<unsigned>(sourceBytes),
+      static_cast<int>(context.v2State), static_cast<unsigned>(context.v2Remaining),
+      keepReading ? 1 : 0, parseFailed ? 1 : 0, static_cast<unsigned>(line.length()));
 
   if (stats.longLineSplits > 0 || stats.malformedUtf8 > 0 || stats.nonAsciiCodepoints > 0) {
     Serial.printf("[storage-index] Parse cleanup: long_lines=%u malformed_utf8=%u non_ascii=%u\n",
