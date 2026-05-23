@@ -8,7 +8,7 @@
 #include <functional>
 #include <vector>
 
-#include "storage/BleDataStore.h"
+#include "ble/BleDataStore.h"
 
 // NimBLE GATT server exposing the multibook BLE schema. Single-connection
 // by design; chunked transfer state lives on the manager.
