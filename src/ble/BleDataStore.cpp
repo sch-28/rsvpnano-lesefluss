@@ -407,6 +407,12 @@ bool BleDataStore::deleteBook(const String &hash) {
   if (!SD_MMC.remove(path)) {
     return false;
   }
+  // Sidecars: stale .ridx / .rdat would shadow the next upload's fresh
+  // build, since the indexer skips rebuild when the fingerprint still
+  // matches. Suffixes mirror indexedIndexPathFor / indexedDataPathFor
+  // in StorageManager.cpp.
+  SD_MMC.remove(path + ".ridx");
+  SD_MMC.remove(path + ".rdat");
   const String posKey = bookPositionKey(hash);
   const String cntKey = bookWordCountKey(hash);
   if (preferences_.isKey(posKey.c_str())) {
